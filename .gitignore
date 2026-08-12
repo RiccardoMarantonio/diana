@@ -1,4 +1,15 @@
 .env
-PROJECT_INSTRUCTIONS.md
-.venv
+# Python-generated files
 __pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# User
+
+PROJECT_INSTRUCTIONS.md
