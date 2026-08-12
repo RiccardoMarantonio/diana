@@ -33,7 +33,7 @@ class DiffusionSchedule(nn.Module):
             )
             alphas_bar = f_t / f_t[0]
             betas = 1.0 - (alphas_bar[1:] / alphas_bar[:-1])
-            betas.clamp(0, 0.999)
+            betas.clamp_(0, 0.999)
 
         else:
             raise ValueError(f"Unknown schedule type: {schedule_type}")
