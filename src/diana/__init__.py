@@ -1,2 +1,6 @@
+from diana.config import parse_args
+
+
 def main() -> None:
-    print("Hello from diana!")
+    parse_args()
+    print("Config loaded...")

@@ -1,3 +1,4 @@
 .env
 PROJECT_INSTRUCTIONS.md
 .venv
+__pycache__/
