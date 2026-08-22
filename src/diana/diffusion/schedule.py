@@ -33,23 +33,22 @@ class DiffusionSchedule(nn.Module):
             )
             alphas_bar = f_t / f_t[0]
             betas = 1.0 - (alphas_bar[1:] / alphas_bar[:-1])
-            betas.clamp_(0, 0.999)
-
         else:
             raise ValueError(f"Unknown schedule type: {schedule_type}")
+        betas.clamp_(0, 0.999)
 
         alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, alphas.dim())
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
         sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
         sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
 
-        self.register_buffer("betas", betas.to(torch.float16))
-        self.register_buffer("alphas", alphas.to(torch.float16))
-        self.register_buffer("alphas_cumprod", alphas_cumprod.to(torch.float16))
+        self.register_buffer("betas", betas.to(torch.float32))
+        self.register_buffer("alphas", alphas.to(torch.float32))
+        self.register_buffer("alphas_cumprod", alphas_cumprod.to(torch.float32))
         self.register_buffer(
-            "sqrt_alphas_cumprod", sqrt_alphas_cumprod.to(torch.float16)
+            "sqrt_alphas_cumprod", sqrt_alphas_cumprod.to(torch.float32)
         )
         self.register_buffer(
             "sqrt_one_minus_alphas_cumprod",
-            sqrt_one_minus_alphas_cumprod.to(torch.float16),
+            sqrt_one_minus_alphas_cumprod.to(torch.float32),
         )
