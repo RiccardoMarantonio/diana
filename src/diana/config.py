@@ -84,7 +84,7 @@ class Config:
                 f"img_size ({self.img_size}) must be divisible by 2**len(channel_mults) "
                 f"({2**n_levels}) so the network's smallest resolution is an integer"
             )
-        visited_resolutions = {self.img_size // 2**i for i in range(n_levels + 1)}
+        visited_resolutions = {self.img_size // 2**i for i in range(n_levels)}
         if not self.attention_resolutions or any(
             a <= 0 for a in self.attention_resolutions
         ):
@@ -116,6 +116,8 @@ class Config:
             raise ValueError(
                 f"beta_end must be > beta_start ({self.beta_start}), got {self.beta_end}"
             )
+        if self.beta_end < 1.0:
+            raise ValueError(f"beta_end must be < 1.0, got {self.beta_end}")
         if self.objective not in VALID_OBJECTIVES:
             raise ValueError(
                 f"objective must be one of {sorted(VALID_OBJECTIVES)}, got {self.objective!r}"
@@ -265,7 +267,10 @@ def parse_args() -> Config:
         help="Number of diffusion timesteps",
     )
     diffusion_group.add_argument(
-        "--beta_start", type=float, default=argparse.SUPPRESS, help="Starting beta value"
+        "--beta_start",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Starting beta value",
     )
     diffusion_group.add_argument(
         "--beta_end", type=float, default=argparse.SUPPRESS, help="Ending beta value"
@@ -327,10 +332,16 @@ def parse_args() -> Config:
     # ==========================
     hpc_group = parser.add_argument_group("HPC & Hardware")
     hpc_group.add_argument(
-        "--device", type=str, default=argparse.SUPPRESS, help="Device to run on (cuda/cpu)"
+        "--device",
+        type=str,
+        default=argparse.SUPPRESS,
+        help="Device to run on (cuda/cpu)",
     )
     hpc_group.add_argument(
-        "--seed", type=int, default=argparse.SUPPRESS, help="Random seed for reproducibility"
+        "--seed",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Random seed for reproducibility",
     )
     hpc_group.add_argument(
         "--use_amp", action="store_true", help="Use Automatic Mixed Precision (AMP)"

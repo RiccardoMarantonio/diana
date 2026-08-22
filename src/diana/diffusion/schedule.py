@@ -10,7 +10,7 @@ class DiffusionSchedule(nn.Module):
         num_timesteps: int,
         beta_start: float,
         beta_end: float,
-        schedule_param: float = 0.008,
+        schedule_param: float,
     ):
         super().__init__()
         self.num_timesteps = num_timesteps
