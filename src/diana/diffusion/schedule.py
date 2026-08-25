@@ -1,9 +1,18 @@
-import torch
-import torch.nn as nn
 import math
+
+import torch
+from torch import nn
 
 
 class DiffusionSchedule(nn.Module):
+    # Class-level declarations: register_buffer() injects these dynamically,
+    # which static checkers cannot see -- declare them so ty knows the types.
+    betas: torch.Tensor
+    alphas: torch.Tensor
+    alphas_cumprod: torch.Tensor
+    sqrt_alphas_cumprod: torch.Tensor
+    sqrt_one_minus_alphas_cumprod: torch.Tensor
+
     def __init__(
         self,
         schedule_type: str,

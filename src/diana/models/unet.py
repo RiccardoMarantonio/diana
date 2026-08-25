@@ -15,6 +15,10 @@ class SinusoidalEmbedding(nn.Module):
     geometrically spaced frequencies (Vaswani et al., 2017). Parameter-free:
     nothing here ever receives a gradient."""
 
+    # Class-level declaration: register_buffer injects this dynamically;
+    # type checkers need the annotation to resolve subscript access.
+    freqs: torch.Tensor
+
     def __init__(self, dim: int):
         super().__init__()
         if dim <= 0 or dim % 2 != 0:
@@ -182,6 +186,16 @@ class UNet(nn.Module):
     conditions every ResBlock via additive bias.
     """
 
+    # Class-level declarations: constructor assigns via __setattr__ (dynamic),
+    # invisible to static checkers without these annotations.
+    down_levels: nn.ModuleList
+    down_samples: nn.ModuleList
+    mid_block1: ResBlock
+    mid_block2: ResBlock
+    mid_attn: SelfAttention | None
+    up_levels: nn.ModuleList
+    up_samples: nn.ModuleList
+
     def __init__(
         self,
         img_size: int,
@@ -272,6 +286,7 @@ class UNet(nn.Module):
         skips: list[torch.Tensor] = [h]
 
         for level_idx, blocks in enumerate(self.down_levels):
+            assert isinstance(blocks, nn.ModuleList)  # ty: narrows Module → ModuleList
             for block in blocks:
                 if isinstance(block, ResBlock):
                     h = block(h, temb)
@@ -288,6 +303,7 @@ class UNet(nn.Module):
         h = self.mid_block2(h, temb)
 
         for level_idx, blocks in enumerate(self.up_levels):
+            assert isinstance(blocks, nn.ModuleList)  # ty: narrows Module → ModuleList
             for block in blocks:
                 if isinstance(block, ResBlock):
                     # Only ResBlocks consume a skip; attention must NOT pop,
