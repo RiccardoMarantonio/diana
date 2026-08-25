@@ -18,7 +18,7 @@ class Config:
     augment_hflip: bool = False
 
     # Model
-    base_channels: int = 128
+    base_channels: int = 64
     channel_mults: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
     num_res_blocks: int = 2
     attention_resolutions: list[int] = field(default_factory=lambda: [16])
