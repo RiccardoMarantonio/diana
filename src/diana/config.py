@@ -116,7 +116,7 @@ class Config:
             raise ValueError(
                 f"beta_end must be > beta_start ({self.beta_start}), got {self.beta_end}"
             )
-        if self.beta_end < 1.0:
+        if self.beta_end >= 1.0:
             raise ValueError(f"beta_end must be < 1.0, got {self.beta_end}")
         if self.objective not in VALID_OBJECTIVES:
             raise ValueError(
