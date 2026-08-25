@@ -70,3 +70,52 @@ class TimestepEmbedding(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.sinusoidal(t))
+
+
+def _group_norm(channels: int) -> nn.GroupNorm:
+    """GroupNorm with up to 32 groups; group count must divide channel count,
+    so fall back via gcd for odd widths (keeps the block width-agnostic)."""
+    return nn.GroupNorm(math.gcd(32, channels), channels)
+
+
+class ResBlock(nn.Module):
+    """The DDPM residual atom. Two conv branches with GroupNorm/SiLU, timestep
+    injected as an additive per-channel bias between them, and a residual
+    shortcut (1x1 conv only when the channel count changes)."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        time_emb_dim: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.block1 = nn.Sequential(
+            _group_norm(in_channels),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+        )
+        # One Linear total: projects (B, time_emb_dim) -> (B, out_channels),
+        # then broadcast over H,W -- O(1) in spatial size, unlike a 3x3 conv.
+        self.time_proj = nn.Linear(time_emb_dim, out_channels)
+        self.block2 = nn.Sequential(
+            _group_norm(out_channels),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        )
+        # Identity shortcut when shapes already match: zero extra params/memory.
+        self.shortcut = (
+            nn.Identity()
+            if in_channels == out_channels
+            else nn.Conv2d(in_channels, out_channels, 1)
+        )
+
+    def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
+        h = self.block1(x)
+        # temb: (B, time_emb_dim) -> (B, C, 1, 1); broadcasting adds one bias
+        # vector to every spatial location without materializing copies.
+        h = h + self.time_proj(temb)[:, :, None, None]
+        h = self.block2(h)
+        return h + self.shortcut(x)
