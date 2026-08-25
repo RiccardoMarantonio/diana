@@ -119,3 +119,39 @@ class ResBlock(nn.Module):
         h = h + self.time_proj(temb)[:, :, None, None]
         h = self.block2(h)
         return h + self.shortcut(x)
+
+
+class SelfAttention(nn.Module):
+    """Multi-head self-attention over spatial positions, DDPM-style:
+    applied only at low resolutions where the quadratic cost stays cheap."""
+
+    def __init__(self, channels: int, num_heads: int = 4):
+        super().__init__()
+        if channels % num_heads != 0:
+            raise ValueError(
+                f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+            )
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.norm = _group_norm(channels)
+        # 1x1 convs as linear projections: same math as nn.Linear on (B,C,H,W)
+        # but without flatten/unflatten copies of the activation tensor.
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        q, k, v = self.qkv(h).chunk(3, dim=1)  # each (B, C, H, W)
+
+        # (B, C, H*W) -> (B, heads, H*W, head_dim): tokens are pixels,
+        # features split across heads for parallel sub-space attention.
+        def split(t: torch.Tensor) -> torch.Tensor:
+            return t.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
+
+        q, k, v = split(q), split(k), split(v)
+        # Fused kernel: computes softmax(QK^T/sqrt(d))V without ever storing
+        # the full (B*heads, N, N) matrix -- O(N^2) compute, ~O(N) activations.
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(2, 3).contiguous().view(B, C, H, W)
+        return x + self.proj(out)
