@@ -1,15 +1,40 @@
 import argparse
+import dataclasses
+import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 VALID_SCHEDULES = {"linear", "cosine"}
 VALID_OBJECTIVES = {"pred_noise", "pred_x0", "pred_v"}
 VALID_DEVICES = {"cpu", "cuda", "mps", "auto"}
 
 
+def load_toml_config(path: str) -> dict[str, Any]:
+    """Parse a flat TOML config file whose top-level keys mirror Config fields.
+
+    Unknown keys are rejected up front so typos surface as a clear error
+    instead of a confusing TypeError deep in Config construction.
+    """
+    cfg_path = Path(path)
+    if not cfg_path.is_file():
+        raise ValueError(f"config file not found: {path}")
+    with cfg_path.open("rb") as f:
+        data = dict(tomllib.load(f))
+    valid = {field.name for field in dataclasses.fields(Config)}
+    unknown = sorted(set(data) - valid)
+    if unknown:
+        raise ValueError(
+            f"unknown key(s) in config file {path!r}: {', '.join(unknown)}; "
+            f"valid keys: {', '.join(sorted(valid))}"
+        )
+    return data
+
+
 @dataclass
 class Config:
     # Data
-    data_path: str
+    data_path: str = ""
     category: str = "default"
     img_size: int = 64
     batch_size: int = 32
@@ -169,9 +194,20 @@ class Config:
             )
 
 
-def parse_args() -> Config:
+def parse_args(argv: list[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(
         description="Configuration for Diffusion Model Training"
+    )
+
+    # ==========================
+    # General Arguments
+    # ==========================
+    general_group = parser.add_argument_group("General")
+    general_group.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to a TOML config file; explicitly-set CLI flags override its values",
     )
 
     # ==========================
@@ -179,7 +215,10 @@ def parse_args() -> Config:
     # ==========================
     data_group = parser.add_argument_group("Data")
     data_group.add_argument(
-        "--data_path", type=str, required=True, help="Path to the dataset"
+        "--data_path",
+        type=str,
+        default=argparse.SUPPRESS,
+        help="Path to the dataset (required unless set in --config)",
     )
     data_group.add_argument(
         "--category", type=str, default=argparse.SUPPRESS, help="Dataset category"
@@ -200,11 +239,15 @@ def parse_args() -> Config:
         help="Number of dataloader workers",
     )
     data_group.add_argument(
-        "--pin_memory", action="store_true", help="Pin memory for dataloaders"
+        "--pin_memory",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Pin memory for dataloaders",
     )
     data_group.add_argument(
         "--augment_hflip",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Enable horizontal flip augmentation",
     )
 
@@ -344,14 +387,21 @@ def parse_args() -> Config:
         help="Random seed for reproducibility",
     )
     hpc_group.add_argument(
-        "--use_amp", action="store_true", help="Use Automatic Mixed Precision (AMP)"
+        "--use_amp",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Use Automatic Mixed Precision (AMP)",
     )
     hpc_group.add_argument(
-        "--cudnn_benchmark", action="store_true", help="Enable cuDNN benchmark"
+        "--cudnn_benchmark",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Enable cuDNN benchmark",
     )
     hpc_group.add_argument(
         "--use_cuda_graphs",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Enable CUDA graphs for faster execution",
     )
     hpc_group.add_argument(
@@ -373,4 +423,13 @@ def parse_args() -> Config:
         help="Logging interval in steps",
     )
 
-    return Config(**vars(parser.parse_args()))
+    ns = vars(parser.parse_args(argv))
+    config_path = ns.pop("config", None)
+
+    # Precedence: CLI > TOML > defaults. argparse.SUPPRESS means unset flags
+    # never appear in ns, so only explicitly-given flags land in overrides.
+    merged: dict[str, Any] = {}
+    if config_path:
+        merged.update(load_toml_config(config_path))
+    merged.update({k: v for k, v in ns.items() if v is not None})
+    return Config(**merged)
