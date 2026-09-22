@@ -39,6 +39,10 @@ class Config:
     img_size: int = 64
     batch_size: int = 32
     num_workers: int = 4
+    # Keep worker processes alive across epochs instead of forking fresh
+    # processes (and leaking their pipes) in every iteration; auto-disabled
+    # when num_workers == 0 since torch rejects that combination.
+    persistent_workers: bool = True
     pin_memory: bool = False
     augment_hflip: bool = False
 
@@ -262,6 +266,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=int,
         default=argparse.SUPPRESS,
         help="Number of dataloader workers",
+    )
+    data_group.add_argument(
+        "--no_persistent_workers",
+        action="store_false",
+        dest="persistent_workers",
+        default=argparse.SUPPRESS,
+        help="Re-fork dataloader workers every epoch instead of keeping them alive",
     )
     data_group.add_argument(
         "--pin_memory",

@@ -133,3 +133,23 @@ class TestMVTecDataset:
         loader = make_dataloader(cfg)
         x = next(iter(loader))
         assert x.shape == (2, 3, 16, 16)
+
+
+class TestPersistentWorkers:
+    """Workers must live across epochs when possible; torch rejects
+    persistent workers with num_workers == 0, so that combo auto-disables."""
+
+    def test_enabled_with_workers(self):
+        cfg = Config(data_path="synthetic", category="x", img_size=16,
+                     num_workers=2)
+        assert make_dataloader(cfg).persistent_workers is True
+
+    def test_auto_disabled_with_zero_workers(self):
+        cfg = Config(data_path="synthetic", category="x", img_size=16,
+                     num_workers=0)
+        assert make_dataloader(cfg).persistent_workers is False
+
+    def test_explicitly_disabled(self):
+        cfg = Config(data_path="synthetic", category="x", img_size=16,
+                     num_workers=2, persistent_workers=False)
+        assert make_dataloader(cfg).persistent_workers is False

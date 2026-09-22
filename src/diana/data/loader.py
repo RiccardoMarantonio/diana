@@ -56,6 +56,11 @@ def make_dataloader(config: Config) -> DataLoader:
         dataset,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
+        # Keep workers alive across epochs: forking + reaping worker processes
+        # in every iteration slowly leaks pipes, and on systems with a modest
+        # fd soft limit (e.g. macOS's default 256) long runs eventually die
+        # with EMFILE ("Too many open files").
+        persistent_workers=config.persistent_workers and config.num_workers > 0,
         pin_memory=config.pin_memory,
         worker_init_fn=worker_init_fn,
         drop_last=True,
