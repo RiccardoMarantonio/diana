@@ -38,6 +38,18 @@ class DDPM(nn.Module):
     # Training objective
     # ------------------------------------------------------------------
 
+    def loss_from(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """Epsilon-matching loss for *given* timesteps and noise.
+
+        The stochastic pieces (t draw, noise draw) are injected by the caller
+        so the deterministic core can run inside a CUDA-graph capture while
+        the random numbers stay fresh per step (a captured ``randn`` would
+        freeze training). ``loss()`` below is just this with the draws.
+        """
+        x_t = self.q_sample(x0, t, noise)
+        eps_pred = self.unet(x_t, t)
+        return F.mse_loss(eps_pred, noise)
+
     def loss(self, x0: torch.Tensor) -> torch.Tensor:
         """Epsilon-matching loss: predict the noise added to a random-t
         corruption of the batch. One uniform-random timestep per sample --
@@ -46,9 +58,7 @@ class DDPM(nn.Module):
         device = x0.device
         t = torch.randint(0, self.schedule.num_timesteps, (batch,), device=device)
         noise = torch.randn_like(x0)
-        x_t = self.q_sample(x0, t, noise)
-        eps_pred = self.unet(x_t, t)
-        return F.mse_loss(eps_pred, noise)
+        return self.loss_from(x0, t, noise)
 
     # ------------------------------------------------------------------
     # Reverse process (inference only)

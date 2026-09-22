@@ -11,6 +11,7 @@ so an ephemeral Colab session can pick up exactly where it died.
 import dataclasses
 import json
 import os
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 import torch
@@ -23,6 +24,7 @@ from diana.diffusion.schedule import DiffusionSchedule
 from diana.models.ema import EMA
 from diana.models.unet import UNet
 from diana.utils.amp import GradScaler, autocast
+from diana.utils.cudagraphs import CudaGraphStep
 from diana.utils.device import configure_backends, resolve_device, set_seed
 
 LAST_CKPT = "last.pt"
@@ -142,19 +144,24 @@ def _provenance(config: Config, run_dir: str) -> None:
 
 def train_epoch(
     model: DDPM,
-    loader: torch.utils.data.DataLoader,
+    loader: Iterable[torch.Tensor],
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
     ema: EMA,
     config: Config,
     epoch: int,
     global_step: int,
+    graph: CudaGraphStep | None = None,
 ) -> tuple[float, int]:
     """One epoch, accumulating grads over ``grad_accum_steps`` micro-batches.
 
     Returns ``(mean_loss, global_step)``. Each micro-loss is divided by the
     accumulation factor up front so the summed gradient is the gradient of the
     mean loss, while reported loss stays on the true (unscaled) scale.
+
+    With ``use_cuda_graphs`` the forward+backward is replaced by a replayed
+    ``CUDAGraph`` (see :class:`CudaGraphStep`); the optimizer clip/step/update
+    still runs every micro-batch because accumulation is disabled in that mode.
     """
     device = next(model.parameters()).device
     accum = config.grad_accum_steps
@@ -164,6 +171,30 @@ def train_epoch(
 
     for micro, batch in enumerate(loader, 1):
         x = batch.to(device, non_blocking=config.pin_memory)
+
+        if graph is not None and graph.enabled:
+            optimizer.zero_grad(set_to_none=False)
+            loss = graph.step(x)
+            forward_loss = float(loss.detach())
+            epoch_loss += forward_loss
+            for group in optimizer.param_groups:
+                group["lr"] = lr_at_step(global_step, config)
+            scaler.clip_grad_norm_(optimizer, config.grad_clip)
+            stepped = scaler.step(optimizer)
+            scaler.update()
+            if stepped:
+                ema.update(model)
+            global_step += 1
+            ran += 1
+            if global_step % config.log_every_n_steps == 0:
+                lr = optimizer.param_groups[0]["lr"]
+                print(
+                    f"[epoch {epoch}] step {global_step} | loss {forward_loss:.4f} "
+                    f"| lr {lr:.2e} | clipped grad_norm to {config.grad_clip} | greplay=CUDA"
+                )
+            del loss, x
+            continue
+
         with autocast(device, enabled=config.use_amp):
             loss = model.loss(x)
         forward_loss = float(loss.detach())
@@ -209,6 +240,8 @@ def run_training(config: Config, device: torch.device) -> dict:
     )
     _provenance(config, run_dir)
 
+    graph = CudaGraphStep(model, device, scaler, enabled=config.use_cuda_graphs)
+
     global_step = 0
     start_epoch = 0
     best_loss = float("inf")
@@ -224,14 +257,20 @@ def run_training(config: Config, device: torch.device) -> dict:
     loader = make_dataloader(config)
     print(
         f"[start] device={device.type} amp={'on' if scaler.enabled else 'off'} "
+        f"cuda_graphs={'on' if graph.enabled else 'off'} "
         f"steps/epoch={len(loader) // config.grad_accum_steps} "
         f"checkpoints -> {run_dir}"
     )
+    if config.use_cuda_graphs and config.dropout > 0:
+        print(
+            f"[warn] use_cuda_graphs with dropout={config.dropout}: dropout masks "
+            "are frozen at capture time; use dropout=0 for parity with eager training"
+        )
 
     results: dict = {"losses": [], "best_loss": best_loss}
     for epoch in range(start_epoch, config.epochs):
         loss, global_step = train_epoch(
-            model, loader, optimizer, scaler, ema, config, epoch, global_step
+            model, loader, optimizer, scaler, ema, config, epoch, global_step, graph
         )
         results["losses"].append(loss)
         if loss < best_loss:
