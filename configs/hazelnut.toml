@@ -1,0 +1,40 @@
+# Canonical single-category MVTec (hazelnut) diffusion training settings.
+# Override any key at the CLI with a flag (CLI > TOML > defaults).
+data_path = "data/mvtec"
+category = "hazelnut"
+img_size = 64
+batch_size = 16
+num_workers = 4
+pin_memory = true
+augment_hflip = true
+
+base_channels = 64
+channel_mults = [1, 2, 4, 8]
+num_res_blocks = 2
+attention_resolutions = [16]
+dropout = 0.1
+ema_decay = 0.9999
+
+schedule_type = "linear"
+num_timesteps = 1000
+beta_start = 0.0001
+beta_end = 0.02
+schedule_param = 0.0
+objective = "pred_noise"
+sample_timesteps = 250
+
+epochs = 100
+learning_rate = 0.0001
+weight_decay = 0.000001
+lr_warmup_steps = 1000
+grad_clip = 1.0
+grad_accum_steps = 1
+
+device = "auto"
+seed = 42
+use_amp = false
+cudnn_benchmark = false
+use_cuda_graphs = false
+checkpoint_dir = "runs"
+save_every_n_epochs = 25
+log_every_n_steps = 25
