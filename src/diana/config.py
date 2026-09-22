@@ -223,7 +223,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--data_path",
         type=str,
         default=argparse.SUPPRESS,
-        help="Path to the dataset (required unless set in --config)",
+        help="Dataset root containing <category>/train/good (or 'synthetic')",
     )
     data_group.add_argument(
         "--category", type=str, default=argparse.SUPPRESS, help="Dataset category"

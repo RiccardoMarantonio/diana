@@ -1,15 +1,18 @@
 """Dataloader factory.
 
-Serves the training loop a DataLoader regardless of the data source. The
-``"synthetic"`` sentinel yields random-image tensors sized from the config, so
-the full train/smoke path is exercisable before the real MVTec dataset is
-wired in behind the same :func:`make_dataloader` contract (Phase 4).
+Serves the training loop a DataLoader regardless of the data source:
+``data_path == "synthetic"`` yields random-image tensors sized from the config
+(smoke/profiling runs), while any real path routes to the MVTec dataset for
+``config.category`` behind the same :func:`make_dataloader` contract.
 """
+
+import os
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from diana.config import Config
+from diana.data.mvtec import MVTecDataset
 from diana.utils.device import worker_init_fn
 
 SYNTHETIC_SENTINEL = "synthetic"
@@ -36,11 +39,18 @@ class SyntheticDataset(Dataset):
 def make_dataloader(config: Config) -> DataLoader:
     if config.data_path == SYNTHETIC_SENTINEL:
         dataset: Dataset = SyntheticDataset(config)
+    elif os.path.isdir(os.path.join(config.data_path, config.category, "train")):
+        dataset = MVTecDataset(
+            config.data_path,
+            config.category,
+            img_size=config.img_size,
+            augment=config.augment_hflip,
+        )
     else:
-        # Real MVTec loading replaced by this branch in Phase 4.
-        raise NotImplementedError(
-            f"only data_path={SYNTHETIC_SENTINEL!r} is wired so far; got "
-            f"{config.data_path!r}"
+        raise RuntimeError(
+            f"no dataset at {config.data_path!r}; pass --data_path synthetic for a "
+            f"random-tensor smoke run, or fetch a category with: "
+            f"python -m diana.data.download --categories {config.category}"
         )
     return DataLoader(
         dataset,
