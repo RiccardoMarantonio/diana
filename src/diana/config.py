@@ -74,6 +74,7 @@ class Config:
     cudnn_benchmark: bool = False
     use_cuda_graphs: bool = False
     checkpoint_dir: str = "./checkpoints"
+    save_every_n_epochs: int = 25
     resume_from: str | None = None
     log_every_n_steps: int = 50
 
@@ -188,6 +189,10 @@ class Config:
             )
         if self.seed < 0:
             raise ValueError(f"seed must be >= 0, got {self.seed}")
+        if self.save_every_n_epochs < 1:
+            raise ValueError(
+                f"save_every_n_epochs must be >= 1, got {self.save_every_n_epochs}"
+            )
         if self.log_every_n_steps < 1:
             raise ValueError(
                 f"log_every_n_steps must be >= 1, got {self.log_every_n_steps}"
@@ -408,7 +413,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--checkpoint_dir",
         type=str,
         default=argparse.SUPPRESS,
-        help="Directory to save checkpoints",
+        help="Root directory for run outputs and checkpoints",
+    )
+    hpc_group.add_argument(
+        "--save_every_n_epochs",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Checkpoint cadence: save a rotating checkpoint every N epochs",
     )
     hpc_group.add_argument(
         "--resume_from",
