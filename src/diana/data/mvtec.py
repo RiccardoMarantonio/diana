@@ -53,7 +53,7 @@ class MVTecDataset(Dataset):
 
     def __getitem__(self, index: int) -> torch.Tensor:
         img = Image.open(self._paths[index]).convert("RGB")
-        img = img.resize((self._resize, self._resize), Image.BILINEAR)
+        img = img.resize((self._resize, self._resize), Image.Resampling.BILINEAR)
         if self._resize != self._crop:
             left = top = (self._resize - self._crop) // 2
             img = img.crop((left, top, left + self._crop, top + self._crop))
