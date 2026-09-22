@@ -1,6 +1,8 @@
+import json
 import os
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
@@ -153,3 +155,35 @@ class TestEndToEndInference:
         assert result["pixel_auroc"] is not None
         assert 0.0 <= result["pixel_auroc"] <= 1.0
         assert os.path.isfile(os.path.join(run_dir, "eval.json"))
+
+
+class TestNoEmaFallback:
+    """A checkpoint whose EMA never advanced (the T4/AMP step-retval bug)."""
+
+    def _write_dead_ema_checkpoint(self, tmp_path):
+        root = _fake_mvtec(tmp_path)
+        cfg = _cfg(data_path=root, category="hazelnut", checkpoint_dir=str(tmp_path), epochs=1)
+        model = build_ddpm(cfg)
+        opt = build_optimizer(cfg, model)
+        ema = EMA(model, cfg.ema_decay)  # steps == 0, shadows all zero
+        scaler = GradScaler(torch.device("cpu"), enabled=False)
+        run_dir = os.path.join(str(tmp_path), "run")
+        save_checkpoint(run_dir, "best.pt", cfg, model, opt, scaler, ema,
+                        epoch=0, global_step=0, best_loss=1.0)
+        return run_dir
+
+    def test_default_apply_still_raises(self, tmp_path):
+        run_dir = self._write_dead_ema_checkpoint(tmp_path)
+        with pytest.raises(RuntimeError, match="before any update"):
+            run_inference(run_dir, tag="best", t_start=8, num_steps=8, out=None, limit=4)
+
+    def test_no_ema_scores_live_weights(self, tmp_path):
+        run_dir = self._write_dead_ema_checkpoint(tmp_path)
+        out = os.path.join(str(tmp_path), "grid.png")
+        result = run_inference(run_dir, tag="best", t_start=8, num_steps=8,
+                               out=out, limit=4, use_ema=False)
+        assert result["ema_applied"] is False
+        assert result["n"] == 4
+        assert os.path.isfile(out)
+        with open(os.path.join(run_dir, "eval.json")) as f:
+            assert json.load(f)["ema_applied"] is False

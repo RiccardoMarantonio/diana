@@ -71,8 +71,12 @@ class GradScaler:
     def step(self, optimizer: torch.optim.Optimizer) -> bool:
         """Run the optimizer step, refusing to fire before clipping.
 
-        Returns True when the optimizer actually stepped (False when AMP
-        skipped the step due to inf/nan grads).
+        Returns True whenever the step was attempted. Note that torch's
+        scaler returns ``optimizer.step()``'s own retval, which is ``None``
+        for optimizers like AdamW even on success -- so callers must not
+        interpret the retval as "did we step". An inf/nan skip just leaves
+        the weights unchanged; callers that average weights (EMA) are safe
+        either way.
         """
         if not self._unscaled:
             raise RuntimeError(
@@ -80,9 +84,7 @@ class GradScaler:
                 "backward -> clip_grad_norm_ -> step ordering"
             )
         self._unscaled = False
-        if self._enabled:
-            return bool(self._scaler.step(optimizer))
-        self._scaler.step(optimizer)
+        self._scaler.step(optimizer)  # retval unreliable (None for AdamW)
         return True
 
     def update(self) -> None:

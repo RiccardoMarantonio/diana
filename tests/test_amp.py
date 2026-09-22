@@ -71,3 +71,38 @@ class TestGradScalerEnabled:
         if not torch.cuda.is_available():
             pytest.skip("cuda not available")
         assert GradScaler(torch.device("cuda"), enabled=True).enabled is True
+
+
+class _NoneRetValScaler:
+    """Stands in for torch.amp.GradScaler on CUDA with AdamW.
+
+    torch's ``step()`` returns ``optimizer.step()``'s retval, which is
+    ``None`` for AdamW even on a successful step.
+    """
+
+    def unscale_(self, optimizer):
+        pass
+
+    def step(self, optimizer):
+        optimizer.step()
+
+    def update(self):
+        pass
+
+
+class TestStepReturnValueContract:
+    def test_step_true_even_when_inner_scaler_returns_none(self):
+        """The wrapper must not turn torch's None retval into False.
+
+        That exact mistake gated EMA updates behind `if stepped:` and left
+        every AMP checkpoint on the T4 with an empty EMA (steps=0).
+        """
+        model = torch.nn.Linear(4, 1)
+        opt = _make_optimizer(model)
+        scaler = GradScaler(torch.device("cpu"), enabled=False)
+        scaler.backward((model(torch.randn(8, 4)) ** 2).mean())
+        scaler.clip_grad_norm_(opt, max_norm=1.0)
+        scaler._enabled = True  # force the CUDA/AMP code path
+        scaler._scaler = _NoneRetValScaler()  # retval = None, as with torch+AdamW
+        assert scaler.step(opt) is True
+        scaler.update()

@@ -131,11 +131,13 @@ def run_inference(
     out: str,
     limit: int | None,
     pixel: bool = False,
+    use_ema: bool = True,
 ) -> dict:
     cfg, model, ema = load_checkpoint_run(run_dir, tag)
     device = resolve_device(cfg.device)
     model.to(device)
-    ema.apply(model)  # sampling scores come from the EMA weights
+    if use_ema:
+        ema.apply(model)  # sampling scores come from the EMA weights
     try:
         ds = MVTecEvalDataset(cfg.data_path, cfg.category, img_size=cfg.img_size)
         indices = list(range(len(ds))) if limit is None else np.linspace(0, len(ds) - 1, limit).astype(int)
@@ -190,6 +192,7 @@ def run_inference(
         report = {
             "tag": tag, "t_start": t_start, "num_steps": num_steps,
             "device": device.type, "n": len(scores),
+            "ema_applied": use_ema,
             "image_auroc": round(image_auc, 6),
             "pixel_auroc": round(pixel_auc, 6) if pixel_auc is not None else None,
             "good_mean": round(good, 6), "defect_mean": round(bad, 6),
@@ -199,7 +202,7 @@ def run_inference(
         with open(eval_json, "w") as f:
             json.dump(report, f, indent=2, sort_keys=True)
 
-        print(f"[score] t_start={t_start} steps={num_steps} device={device.type}")
+        print(f"[score] t_start={t_start} steps={num_steps} device={device.type} ema={'on' if use_ema else 'off'}")
         print(f"[auc] image-level AUROC = {image_auc:.4f} on {len(scores)} test images")
         if pixel_auc is not None:
             print(f"[auc] pixel-level AUROC = {pixel_auc:.4f} vs ground-truth masks")
@@ -208,7 +211,8 @@ def run_inference(
         print(f"[out] eval.json -> {eval_json}")
         return report
     finally:
-        ema.restore(model)
+        if use_ema:
+            ema.restore(model)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -222,12 +226,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--limit", type=int, default=64, help="Max test images to score")
     parser.add_argument("--pixel", action="store_true",
                         help="Also score pixel-level AUROC against ground-truth masks (defective images only)")
+    parser.add_argument("--no_ema", action="store_true",
+                        help="Score with the live (non-EMA) weights; for checkpoints whose EMA never advanced")
     args = parser.parse_args(argv)
 
     cfg, _, _ = load_checkpoint_run(args.run, args.tag)
     num_steps = args.num_steps or cfg.sample_timesteps
     t_start = args.t_start if args.t_start is not None else cfg.eval_t_start_effective
-    run_inference(args.run, args.tag, t_start, num_steps, args.out, args.limit, pixel=args.pixel)
+    run_inference(args.run, args.tag, t_start, num_steps, args.out, args.limit,
+                  pixel=args.pixel, use_ema=not args.no_ema)
 
 
 if __name__ == "__main__":

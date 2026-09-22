@@ -180,10 +180,12 @@ def train_epoch(
             for group in optimizer.param_groups:
                 group["lr"] = lr_at_step(global_step, config)
             scaler.clip_grad_norm_(optimizer, config.grad_clip)
-            stepped = scaler.step(optimizer)
+            scaler.step(optimizer)
             scaler.update()
-            if stepped:
-                ema.update(model)
+            # Unconditional: a scaler retval is not a reliable "did we step"
+            # signal (None for AdamW even on success), and averaging unchanged
+            # weights during an inf-skip is benign.
+            ema.update(model)
             global_step += 1
             ran += 1
             if global_step % config.log_every_n_steps == 0:
@@ -206,10 +208,9 @@ def train_epoch(
             for group in optimizer.param_groups:
                 group["lr"] = lr_at_step(global_step, config)
             scaler.clip_grad_norm_(optimizer, config.grad_clip)
-            stepped = scaler.step(optimizer)
+            scaler.step(optimizer)
             scaler.update()
-            if stepped:
-                ema.update(model)
+            ema.update(model)
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
             ran += 1
