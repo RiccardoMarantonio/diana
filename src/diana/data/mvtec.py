@@ -34,6 +34,21 @@ def _load_image(path: str, resize: int, crop: int) -> torch.Tensor:
     return out.permute(2, 0, 1)
 
 
+def _load_mask(path: str, resize: int, crop: int) -> torch.Tensor:
+    """Binary segmentation mask through the *image-equivalent* transform.
+
+    Same resize dimensions and center-crop offset as :func:`_load_image`, so
+    mask pixels stay coordinate-aligned with the image; nearest-neighbour
+    scaling keeps the mask exactly binary.
+    """
+    m = Image.open(path).resize((resize, resize), Image.Resampling.NEAREST)
+    if resize != crop:
+        left = top = (resize - crop) // 2
+        m = m.crop((left, top, left + crop, top + crop))
+    arr = np.asarray(m.convert("L"), dtype=np.float32)
+    return torch.from_numpy((arr > 0.5 * 255).astype(np.float32)).unsqueeze(0)  # (1, H, W)
+
+
 class MVTecDataset(Dataset):
     """Training split (defect-free ``good`` images) of one MVTec category."""
 
@@ -70,10 +85,11 @@ class MVTecDataset(Dataset):
 
 
 class MVTecEvalDataset(Dataset):
-    """Test split of a category with ``label = 0`` for ``good`` and 1 otherwise.
+    """Test split of a category: ``(image, label, mask)`` per sample.
 
-    Same preprocessing as :class:`MVTecDataset`: defect-free and defective
-    test images share the pipeline, so reconstruction residuals are comparable.
+    ``label = 0`` for ``good`` images (zero mask) and 1 otherwise, with the
+    binary ground-truth segmentation mask passed through the image-equivalent
+    resize + center-crop so reconstruction residuals and GT pixels align.
     """
 
     def __init__(self, root: str, category: str, img_size: int = 64):
@@ -87,15 +103,24 @@ class MVTecEvalDataset(Dataset):
                 f"no MVTec test images at {test_dir!r}; fetch them with: "
                 f"python -m diana.data.download --categories {category}"
             )
-        samples: list[tuple[str, int]] = []
+        samples: list[tuple[str, int, str | None]] = []
         for sub in sorted(os.listdir(test_dir)):
             sub_dir = os.path.join(test_dir, sub)
             if not os.path.isdir(sub_dir):
                 continue
             label = 0 if sub == "good" else 1
+            gt_dir = os.path.join(root, category, "ground_truth", sub)
             for f in sorted(os.listdir(sub_dir)):
-                if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
-                    samples.append((os.path.join(sub_dir, f), label))
+                if not f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                    continue
+                mask_path = None
+                if label:
+                    stem = os.path.splitext(f)[0]
+                    for cand in (f"{stem}_mask.png", f"{stem}_mask.jpg", f"{stem}_mask.jpeg"):
+                        if os.path.isfile(os.path.join(gt_dir, cand)):
+                            mask_path = os.path.join(gt_dir, cand)
+                            break
+                samples.append((os.path.join(sub_dir, f), label, mask_path))
         if not samples:
             raise RuntimeError(f"no test images found in {test_dir!r}")
         self._samples = samples
@@ -105,6 +130,11 @@ class MVTecEvalDataset(Dataset):
     def __len__(self) -> int:
         return len(self._samples)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-        path, label = self._samples[index]
-        return _load_image(path, self._resize, self._crop), label
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int, torch.Tensor]:
+        path, label, mask_path = self._samples[index]
+        image = _load_image(path, self._resize, self._crop)
+        if mask_path is None:
+            mask = torch.zeros(1, self._crop, self._crop)
+        else:
+            mask = _load_mask(mask_path, self._resize, self._crop)
+        return image, label, mask
