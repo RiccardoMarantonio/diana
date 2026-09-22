@@ -13,3 +13,5 @@ wheels/
 # User
 
 PROJECT_INSTRUCTIONS.md
+/data/
+/runs/
