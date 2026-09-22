@@ -54,29 +54,34 @@ uv run python -m diana.train --config configs/hazelnut.toml \
 uv run python -m diana.sample --run runs/hazelnut-<timestamp> --pixel
 ```
 
-## Colab T4 runbook (M3/M4)
+## One-shot run (Colab T4 or local)
 
-`data/` is gitignored, so clone and re-download on the VM. Use the HTTPS URL.
+`t4.sh` is device-agnostic (`device = "auto"` picks CUDA on Colab, MPS on
+Apple Silicon) and self-contained — benchmark, train, then sweep `t_start`
+and write the pixel-level evaluation:
 
 ```bash
 git clone https://github.com/RiccardoMarantonio/diana.git && cd diana
-uv sync                                        # or venv + pip install -e .
-python -m diana.data.download --categories hazelnut
+bash t4.sh              # 100 epochs, 200-sample eval (Colab)
+bash t4.sh 3 32         # local smoke: 3 epochs, 32-sample eval
+```
 
-# pick HPC switches by measurement first:
-python -m diana.profiler sweep --config configs/hazelnut.toml --device cuda --steps 50
+`data/` is gitignored, so the script re-downloads it on a fresh machine. If a
+session dies mid-training, resume (the config snapshot lives in the run dir):
 
-# then train (AMP + benchmark; CUDA graphs optional, see dropout note)
-python -m diana.train --config configs/hazelnut.toml \
-    --device cuda --use_amp --cudnn_benchmark --epochs 100
+```bash
+bash t4.sh 100 200      # or, manually:
+uv run python -m diana.train --config configs/hazelnut.toml --resume_from runs/hazelnut-<ts>
+```
 
-# checkpoint cadence writes runs/hazelnut-<ts>/{best,last}.pt; if the VM dies,
-# resume (config snapshot is in the run dir):
-python -m diana.train --config configs/hazelnut.toml \
-    --device cuda --use_amp --cudnn_benchmark --resume_from runs/hazelnut-<ts>
+Manual equivalents (defaults shown):
 
-# final evaluation (image + pixel AUROC against ground_truth masks)
-python -m diana.sample --run runs/hazelnut-<ts> --pixel --limit 200
+```bash
+uv run python -m diana.data.download --categories hazelnut
+uv run python -m diana.profiler sweep --config configs/hazelnut.toml --steps 50
+uv run python -m diana.train --config configs/hazelnut.toml \
+    --use_amp --cudnn_benchmark --epochs 100
+uv run python -m diana.sample --run runs/hazelnut-<ts> --pixel --limit 200
 ```
 
 Notes:
