@@ -58,6 +58,7 @@ class Config:
     schedule_param: float = 0.0
     objective: str = "pred_noise"
     sample_timesteps: int = 250
+    eval_t_start: int | None = None
 
     # Optim
     epochs: int = 100
@@ -77,6 +78,17 @@ class Config:
     save_every_n_epochs: int = 25
     resume_from: str | None = None
     log_every_n_steps: int = 50
+
+    @property
+    def eval_t_start_effective(self) -> int:
+        """Noising dial for anomaly inference.
+
+        Authoritative when ``eval_t_start`` is pinned; otherwise a fraction of
+        the chain (``num_timesteps // 10``) so small schedules stay sane.
+        """
+        if self.eval_t_start is not None:
+            return self.eval_t_start
+        return self.num_timesteps // 10
 
     def __post_init__(self):
         # Data
@@ -161,6 +173,10 @@ class Config:
                 f"num_timesteps ({self.num_timesteps}) must be divisible by sample_timesteps "
                 f"({self.sample_timesteps}) so the reverse chain can be strided evenly"
             )
+        if self.eval_t_start is not None and not 0 <= self.eval_t_start < self.num_timesteps:
+            raise ValueError(
+                f"eval_t_start must be in [0, num_timesteps), got {self.eval_t_start}"
+            )
 
         # Optim
         if self.epochs < 1:
@@ -196,6 +212,10 @@ class Config:
         if self.log_every_n_steps < 1:
             raise ValueError(
                 f"log_every_n_steps must be >= 1, got {self.log_every_n_steps}"
+            )
+        if self.use_cuda_graphs and self.grad_accum_steps != 1:
+            raise ValueError(
+                f"use_cuda_graphs requires grad_accum_steps == 1, got {self.grad_accum_steps}"
             )
 
 
@@ -341,6 +361,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=int,
         default=argparse.SUPPRESS,
         help="Timesteps to use during sampling/inference",
+    )
+    diffusion_group.add_argument(
+        "--eval_t_start",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Default SDEdit noising level for anomaly inference",
     )
 
     # ==========================

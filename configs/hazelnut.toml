@@ -22,6 +22,9 @@ beta_end = 0.02
 schedule_param = 0.0
 objective = "pred_noise"
 sample_timesteps = 250
+# SDEdit noising dial for anomaly inference; sweep {50..200} on a full model.
+# Milano local sweep (warmup ckpt): 150 -> image AUROC 0.730 (best of {50,100,150,200}).
+eval_t_start = 150
 
 epochs = 100
 learning_rate = 0.0001

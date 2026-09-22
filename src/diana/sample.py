@@ -145,7 +145,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--run", required=True, help="Run directory holding best.pt / last.pt")
     parser.add_argument("--tag", default="best", choices=["best", "last"])
-    parser.add_argument("--t_start", type=int, default=100, help="SDEdit noising level; higher = stronger healing")
+    parser.add_argument("--t_start", type=int, default=None,
+                        help="SDEdit noising level; higher = stronger healing (default: checkpointed eval_t_start)")
     parser.add_argument("--num_steps", type=int, default=None, help="Sampling strides (default: checkpointed config)")
     parser.add_argument("--out", default=None, help="Output grid PNG path")
     parser.add_argument("--limit", type=int, default=64, help="Max test images to score")
@@ -153,7 +154,8 @@ def main(argv: list[str] | None = None) -> None:
 
     cfg, _, _ = load_checkpoint_run(args.run, args.tag)
     num_steps = args.num_steps or cfg.sample_timesteps
-    run_inference(args.run, args.tag, args.t_start, num_steps, args.out, args.limit)
+    t_start = args.t_start if args.t_start is not None else cfg.eval_t_start_effective
+    run_inference(args.run, args.tag, t_start, num_steps, args.out, args.limit)
 
 
 if __name__ == "__main__":
