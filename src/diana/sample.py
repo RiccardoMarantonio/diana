@@ -31,7 +31,7 @@ from diana.data.mvtec import MVTecEvalDataset
 from diana.diffusion.ddpm import DDPM
 from diana.models.ema import EMA
 from diana.train import build_ddpm
-from diana.utils.device import resolve_device
+from diana.utils.device import resolve_device, set_seed
 
 
 def load_checkpoint_run(run_dir: str, tag: str = "best") -> tuple[Config, DDPM, EMA]:
@@ -132,12 +132,18 @@ def run_inference(
     limit: int | None,
     pixel: bool = False,
     use_ema: bool = True,
+    seed: int | None = None,
 ) -> dict:
     cfg, model, ema = load_checkpoint_run(run_dir, tag)
     device = resolve_device(cfg.device)
     model.to(device)
     if use_ema:
         ema.apply(model)  # sampling scores come from the EMA weights
+    # SDEdit draws fresh noise per reconstruction; pin the RNG so the same
+    # checkpoint + t_start yields identical scores (defaults to the training
+    # seed). Without this, repeated evals of one model differ by ~±0.03-0.05
+    # AUROC -- pure sampling noise that swamps t_start comparisons.
+    set_seed(cfg.seed if seed is None else seed)
     try:
         ds = MVTecEvalDataset(cfg.data_path, cfg.category, img_size=cfg.img_size)
         indices = list(range(len(ds))) if limit is None else np.linspace(0, len(ds) - 1, limit).astype(int)
@@ -192,7 +198,7 @@ def run_inference(
         report = {
             "tag": tag, "t_start": t_start, "num_steps": num_steps,
             "device": device.type, "n": len(scores),
-            "ema_applied": use_ema,
+            "ema_applied": use_ema, "seed": cfg.seed if seed is None else seed,
             "image_auroc": round(image_auc, 6),
             "pixel_auroc": round(pixel_auc, 6) if pixel_auc is not None else None,
             "good_mean": round(good, 6), "defect_mean": round(bad, 6),
@@ -228,13 +234,16 @@ def main(argv: list[str] | None = None) -> None:
                         help="Also score pixel-level AUROC against ground-truth masks (defective images only)")
     parser.add_argument("--no_ema", action="store_true",
                         help="Score with the live (non-EMA) weights; for checkpoints whose EMA never advanced")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="RNG seed for the SDEdit noise (default: checkpointed config seed); "
+                             "same checkpoint + seed => identical scores")
     args = parser.parse_args(argv)
 
     cfg, _, _ = load_checkpoint_run(args.run, args.tag)
     num_steps = args.num_steps or cfg.sample_timesteps
     t_start = args.t_start if args.t_start is not None else cfg.eval_t_start_effective
     run_inference(args.run, args.tag, t_start, num_steps, args.out, args.limit,
-                  pixel=args.pixel, use_ema=not args.no_ema)
+                  pixel=args.pixel, use_ema=not args.no_ema, seed=args.seed)
 
 
 if __name__ == "__main__":

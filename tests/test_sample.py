@@ -187,3 +187,36 @@ class TestNoEmaFallback:
         assert os.path.isfile(out)
         with open(os.path.join(run_dir, "eval.json")) as f:
             assert json.load(f)["ema_applied"] is False
+
+
+class TestSeededSampling:
+    """SDEdit draws random noise; the seed must make an eval reproducible."""
+
+    def _ckpt(self, tmp_path):
+        root = _fake_mvtec(tmp_path)
+        cfg = _cfg(data_path=root, category="hazelnut", checkpoint_dir=str(tmp_path), epochs=1)
+        model = build_ddpm(cfg)
+        opt = build_optimizer(cfg, model)
+        ema = EMA(model, cfg.ema_decay)
+        ema.update(model)
+        scaler = GradScaler(torch.device("cpu"), enabled=False)
+        run_dir = os.path.join(str(tmp_path), "run")
+        save_checkpoint(run_dir, "best.pt", cfg, model, opt, scaler, ema,
+                        epoch=0, global_step=1, best_loss=1.0)
+        return run_dir
+
+    def test_same_seed_same_scores(self, tmp_path):
+        run_dir = self._ckpt(tmp_path)
+        first = run_inference(run_dir, "best", 8, 8, os.path.join(str(tmp_path), "a.png"),
+                              limit=4, seed=7)
+        second = run_inference(run_dir, "best", 8, 8, os.path.join(str(tmp_path), "b.png"),
+                               limit=4, seed=7)
+        assert first["image_auroc"] == second["image_auroc"]
+        assert first["seed"] == 7
+
+    def test_seed_recorded_in_eval_json(self, tmp_path):
+        run_dir = self._ckpt(tmp_path)
+        run_inference(run_dir, "best", 8, 8, os.path.join(str(tmp_path), "g.png"),
+                      limit=4, seed=3)
+        with open(os.path.join(run_dir, "eval.json")) as f:
+            assert json.load(f)["seed"] == 3
