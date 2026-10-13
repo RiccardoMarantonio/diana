@@ -27,7 +27,9 @@ import contextlib
 import dataclasses
 import itertools
 import json
+import math
 import os
+import sys
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -43,6 +45,7 @@ from diana.train import build_ddpm, build_optimizer, train_epoch
 from diana.utils.amp import GradScaler
 from diana.utils.cudagraphs import CudaGraphStep
 from diana.utils.device import configure_backends, resolve_device, set_seed
+from diana.utils.inference_graph import InferenceGraph
 
 
 def peak_memory_mb(device: torch.device) -> float | None:
@@ -58,8 +61,26 @@ def peak_memory_mb(device: torch.device) -> float | None:
         import resource
 
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return round(rss / 1024 if rss < 2**40 else rss / 1024**2, 2)  # macos KiB, linux bytes
+        return round(rss / (1024**2 if sys.platform == "darwin" else 1024), 2)
     return None
+
+
+def synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+def memory_scope(device: torch.device) -> str:
+    return {"cpu": "process_lifetime_peak_rss", "mps": "current_allocated",
+            "cuda": "measured_interval_peak_allocated"}[device.type]
+
+
+def repeat_batches(loader):
+    """Repeat data without caching tensors or exhausting a single epoch."""
+    while True:
+        yield from loader
 
 
 def _reset_peak(device: torch.device) -> None:
@@ -83,9 +104,9 @@ def _op_table(device: torch.device, prof) -> str:
 
 
 def profile_training(config: Config, device: torch.device, steps: int | None, with_profiler: bool = True) -> dict[str, Any]:
-    """Time the real training spine on synthetic data for ``steps`` micro-batches."""
-    if config.data_path != "synthetic":
-        config.data_path = "synthetic"  # profiling is about the loop, not dataset I/O
+    """Time exactly ``steps`` optimizer updates after two warmup updates."""
+    config = dataclasses.replace(config, data_path="synthetic")
+    configure_backends(device, benchmark=config.cudnn_benchmark)
     set_seed(config.seed)
     model = build_ddpm(config).to(device)
     optimizer = build_optimizer(config, model)
@@ -94,9 +115,24 @@ def profile_training(config: Config, device: torch.device, steps: int | None, wi
     graph = CudaGraphStep(model, device, scaler, enabled=config.use_cuda_graphs)
 
     loader = make_dataloader(config)
-    steps = len(loader) if steps is None else steps
-    stream = itertools.islice(loader, steps)
+    if len(loader) == 0:
+        raise ValueError("profiling loader is empty")
+    steps = math.ceil(len(loader) / config.grad_accum_steps) if steps is None else steps
+    if steps < 1:
+        raise ValueError("steps must be positive")
+    batches = repeat_batches(loader)
+    warmup_steps = 2
+    train_epoch(model, itertools.islice(batches, warmup_steps * config.grad_accum_steps),
+                optimizer, scaler, ema, config, 0, 0, graph)
+    image_count = 0
 
+    def measured_batches():
+        nonlocal image_count
+        for batch in itertools.islice(batches, steps * config.grad_accum_steps):
+            image_count += len(batch)
+            yield batch
+
+    synchronize(device)
     _reset_peak(device)
     prof = None
     ctx: Any = contextlib.nullcontext()
@@ -112,20 +148,26 @@ def profile_training(config: Config, device: torch.device, steps: int | None, wi
 
     wall0 = time.perf_counter()
     with ctx:
-        mean_loss, gs = train_epoch(model, stream, optimizer, scaler, ema, config, 0, 0, graph)
+        mean_loss, gs = train_epoch(model, measured_batches(), optimizer, scaler, ema, config, 0, warmup_steps, graph)
+    synchronize(device)
+    gs -= warmup_steps
     wall = time.perf_counter() - wall0
 
     report = {
         "mode": "train",
         "device": device.type,
         "amp": bool(scaler.enabled),
-        "cudnn_benchmark": bool(config.cudnn_benchmark),
-        "use_cuda_graphs": bool(config.use_cuda_graphs),
+        "cudnn_benchmark": device.type == "cuda" and bool(torch.backends.cudnn.benchmark),
+        "use_cuda_graphs": graph.active,
         "steps": gs,
+        "warmup_steps": warmup_steps,
+        "images": image_count,
+        "images_per_sec": round(image_count / wall, 3) if wall else None,
         "seconds": round(wall, 4),
         "step_per_sec": round(gs / wall, 3) if wall else None,
         "mean_loss": round(float(mean_loss), 6),
         "peak_memory_mb": peak_memory_mb(device),
+        "memory_scope": memory_scope(device),
     }
     return {"report": report, "op_table": _op_table(device, prof)}
 
@@ -139,35 +181,40 @@ def profile_inference(
     num_steps: int | None,
 ) -> dict[str, Any]:
     """Images/s through the eval reconstruct chain (optionally a real checkpoint)."""
+    if steps < 1:
+        raise ValueError("steps must be positive")
     set_seed(config.seed)
     model: DDPM
     if run_dir:
-        cfg_from, model, _ = load_checkpoint_run(run_dir, tag="best")
-        t_start = cfg_from.eval_t_start_effective
-        num_steps = cfg_from.sample_timesteps
+        cfg_from, model, ema = load_checkpoint_run(run_dir, tag="best")
+        ema.apply(model)
+        config = dataclasses.replace(cfg_from, batch_size=config.batch_size,
+                                     use_cuda_graphs=config.use_cuda_graphs)
+        t_start = cfg_from.eval_t_start_effective if t_start is None else t_start
+        num_steps = cfg_from.sample_timesteps if num_steps is None else num_steps
     else:
         model = build_ddpm(config)
         t_start = config.eval_t_start_effective if t_start is None else t_start
         num_steps = config.sample_timesteps if num_steps is None else num_steps
     model.to(device)
     model.eval()
+    denoiser = InferenceGraph(model.unet, enabled=config.use_cuda_graphs)
 
     batch = config.batch_size
     x = torch.randn(batch, 3, config.img_size, config.img_size, device=device)
     with torch.no_grad():
-        model.reconstruct(x, num_steps=num_steps, t_start=t_start)  # warmup
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        model.reconstruct(x, num_steps=num_steps, t_start=t_start, denoiser=denoiser)  # warmup
+        synchronize(device)
         _reset_peak(device)
         wall0 = time.perf_counter()
         for _ in range(steps):
-            model.reconstruct(x, num_steps=num_steps, t_start=t_start)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+            model.reconstruct(x, num_steps=num_steps, t_start=t_start, denoiser=denoiser)
+        synchronize(device)
         wall = time.perf_counter() - wall0
 
     report = {
         "mode": "inference",
+        "use_cuda_graphs": denoiser.graph is not None,
         "device": device.type,
         "category": config.category,
         "t_start": int(t_start),
@@ -177,6 +224,7 @@ def profile_inference(
         "seconds": round(wall, 4),
         "images_per_sec": round(batch * steps / wall, 3) if wall else None,
         "peak_memory_mb": peak_memory_mb(device),
+        "memory_scope": memory_scope(device),
     }
     return {"report": report, "op_table": ""}
 
@@ -207,12 +255,17 @@ def sweep(config: Config, device: torch.device, steps: int | None, out: str | No
     """Compare {amp} x {cudnn_benchmark} combos; single row off-CUDA."""
     combos = [(False, False)] if device.type != "cuda" else list(itertools.product([False, True], [False, True]))
     results = []
-    for amp, bench in combos:
-        cfg = dataclasses.replace(config, use_amp=amp, cudnn_benchmark=bench)
-        res = profile_training(cfg, device, steps, with_profiler=False)
-        res["report"]["category"] = config.category
-        res["report"]["variant"] = f"amp={int(amp)}_bench={int(bench)}"
-        results.append(res)
+    previous = torch.backends.cudnn.benchmark
+    try:
+        for amp, bench in combos:
+            cfg = dataclasses.replace(config, use_amp=amp, cudnn_benchmark=bench)
+            configure_backends(device, benchmark=bench)
+            res = profile_training(cfg, device, steps, with_profiler=False)
+            res["report"]["category"] = config.category
+            res["report"]["variant"] = f"amp={int(amp)}_bench={int(bench)}"
+            results.append(res)
+    finally:
+        torch.backends.cudnn.benchmark = previous
     return _emit(results, out)
 
 
@@ -220,16 +273,20 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("mode", choices=["train", "inference", "sweep"])
     parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--steps", type=int, default=None,
+                        help="Measured optimizer updates (train/sweep) or reconstruction batches (inference)")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--run", type=str, default=None, help="Run dir for inference benchmarking")
     parser.add_argument("--t_start", type=int, default=None)
     parser.add_argument("--num_steps", type=int, default=None)
     parser.add_argument("--out", type=str, default=None)
+    parser.add_argument("--use_cuda_graphs", action="store_true", help="Capture training or denoiser forward on CUDA")
     parser.add_argument("--no_profiler", action="store_true", help="Skip torch.profiler table")
     args = parser.parse_args(argv)
 
     cfg = parse_args(["--config", args.config])
+    if args.use_cuda_graphs:
+        cfg = dataclasses.replace(cfg, use_cuda_graphs=True)
     if args.device:
         cfg.device = args.device
     device = resolve_device(cfg.device)
@@ -240,7 +297,7 @@ def main(argv: list[str] | None = None) -> None:
         res["report"]["category"] = cfg.category
         _emit([res], args.out)
     elif args.mode == "inference":
-        res = profile_inference(cfg, device, args.steps or 3, args.run, args.t_start, args.num_steps)
+        res = profile_inference(cfg, device, 3 if args.steps is None else args.steps, args.run, args.t_start, args.num_steps)
         _emit([res], args.out)
     else:
         sweep(cfg, device, args.steps, args.out)
