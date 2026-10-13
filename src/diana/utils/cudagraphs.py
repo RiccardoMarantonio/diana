@@ -9,7 +9,7 @@ Transparent single-path wrapper around ``forward + backward``:
   buffers, captures ``forward + scaled backward`` as one ``CUDAGraph``, and
   replays it on every later step. The stochastic parts (timestep draw, noise
   draw) happen *outside* capture into static buffers, so per-step randomness
-  stays fresh; a captured ``randn`` would silently freeze training.
+  stays fresh and can be controlled independently of graph replay.
 
 Everything else the optimizer needs stays outside the graph on purpose:
 ``clip_grad_norm_ -> step -> update`` mutate weights in place after replay,
@@ -18,8 +18,8 @@ continue to evolve normally.
 
 Known trade-offs (made explicit rather than hidden):
 
-* Dropout masks are frozen at capture time. For parity between graphed and
-  ungraphed runs, use ``dropout = 0`` in the graphed config.
+* CUDA graph-safe PyTorch RNG operations, including dropout, advance on replay.
+  Use ``dropout = 0`` when comparing fixed-input numerical parity.
 * Gradient accumulation is incompatible (a replay can't accumulate inten-
   tionally); ``Config`` enforces ``grad_accum_steps == 1``.
 * A failed *capture* disables the wrapper and falls back to the eager path so
@@ -84,6 +84,10 @@ class CudaGraphStep:
         if self._graph is None or shape != self._shape:
             self._capture(x, t, noise, shape)
 
+        if not self._enabled:
+            self._model.zero_grad(set_to_none=True)
+            return self.step(x)
+
         assert self._buffers is not None and self._graph is not None
         self._buffers["x"].copy_(x, non_blocking=True)
         self._buffers["t"].copy_(t, non_blocking=True)
@@ -97,16 +101,22 @@ class CudaGraphStep:
         """Priming backward, static-buffer allocation, then one capture."""
         model = self._model
         try:
-            model.zero_grad(set_to_none=False)
-            with autocast(self._device, enabled=self._scaler.enabled):
-                primed = model.loss_from(x, t, noise)
-            self._scaler.backward(primed)
-            model.zero_grad(set_to_none=False)  # keep grad buffers, zero values
+            # Warm up lazy CUDA kernels on a side stream before capture.
+            stream = torch.cuda.Stream(device=self._device)
+            stream.wait_stream(torch.cuda.current_stream(self._device))
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    model.zero_grad(set_to_none=False)
+                    with autocast(self._device, enabled=self._scaler.enabled):
+                        primed = model.loss_from(x, t, noise)
+                    self._scaler.backward(primed)
+                model.zero_grad(set_to_none=False)
+            torch.cuda.current_stream(self._device).wait_stream(stream)
 
             buffers = {
-                "x": torch.empty_like(x),
-                "t": torch.empty_like(t),
-                "noise": torch.empty_like(noise),
+                "x": x.clone(),
+                "t": t.clone(),
+                "noise": noise.clone(),
             }
             graph = torch.cuda.CUDAGraph()
             torch.cuda.synchronize()

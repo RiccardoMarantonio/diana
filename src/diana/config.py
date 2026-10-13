@@ -474,10 +474,17 @@ def parse_args(argv: list[str] | None = None) -> Config:
     ns = vars(parser.parse_args(argv))
     config_path = ns.pop("config", None)
 
-    # Precedence: CLI > TOML > defaults. argparse.SUPPRESS means unset flags
-    # never appear in ns, so only explicitly-given flags land in overrides.
+    # Resume provides a base snapshot; explicit TOML/CLI settings still win.
+    supplied = load_toml_config(config_path) if config_path else {}
+    supplied.update({k: v for k, v in ns.items() if v is not None})
     merged: dict[str, Any] = {}
-    if config_path:
-        merged.update(load_toml_config(config_path))
-    merged.update({k: v for k, v in ns.items() if v is not None})
+    resume = supplied.get("resume_from")
+    if resume:
+        import torch
+
+        checkpoint = Path(resume)
+        if checkpoint.is_dir():
+            checkpoint /= "last.pt"
+        merged.update(torch.load(checkpoint, map_location="cpu")["config"])
+    merged.update(supplied)
     return Config(**merged)

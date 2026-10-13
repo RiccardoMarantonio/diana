@@ -10,14 +10,14 @@ Two pieces with a uniform interface across devices:
 """
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Generator
 
 import torch
 from torch.amp import GradScaler as _TorchGradScaler
 
 
 @contextlib.contextmanager
-def autocast(device: torch.device, enabled: bool = True) -> Iterator[None]:
+def autocast(device: torch.device, enabled: bool = True) -> Generator[None, None, None]:
     """Run a block under fp16 autocast on CUDA; no-op otherwise.
 
     ``enabled`` is the user's ``use_amp`` flag. If it is requested on a
@@ -63,13 +63,13 @@ class GradScaler:
         """Apply AMP loss scaling, then backprop."""
         self._scaler.scale(loss).backward()
 
-    def clip_grad_norm_(self, optimizer: torch.optim.Optimizer, max_norm: float) -> float:
+    def clip_grad_norm_(self, optimizer: torch.optim.Optimizer, max_norm: float, *, sync: bool = True) -> float | torch.Tensor:
         """Unscale (CUDA) then clip by total norm. Must precede :meth:`step`."""
         self._scaler.unscale_(optimizer)
         params = [p for group in optimizer.param_groups for p in group["params"]]
         norm = torch.nn.utils.clip_grad_norm_(params, max_norm)
         self._unscaled = True
-        return float(norm)
+        return float(norm) if sync else norm
 
     def step(self, optimizer: torch.optim.Optimizer) -> bool:
         """Run the optimizer step, refusing to fire before clipping.

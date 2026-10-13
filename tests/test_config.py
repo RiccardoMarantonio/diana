@@ -89,3 +89,15 @@ class TestLoadTomlConfig:
     def test_loads_and_rejects_unknown(self, tmp_path):
         path = _write_toml(tmp_path, "img_size = 16\n")
         assert load_toml_config(path) == {"img_size": 16}
+
+def test_resume_supplies_config_without_repeating_flags(tmp_path):
+    import dataclasses
+
+    import torch
+    cfg = Config(data_path="synthetic", category="saved", img_size=32)
+    torch.save({"config": dataclasses.asdict(cfg)}, tmp_path / "last.pt")
+    restored = parse_args(["--resume_from", str(tmp_path), "--epochs", "200"])
+    assert restored.category == "saved"
+    assert restored.img_size == 32
+    assert restored.data_path == "synthetic"
+    assert restored.epochs == 200

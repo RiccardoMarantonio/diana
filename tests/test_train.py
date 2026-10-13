@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -253,3 +254,84 @@ class TestEndToEnd:
         main(cli)
         run_dir = os.path.join(str(tmp_path), os.listdir(tmp_path)[0])
         assert os.path.exists(os.path.join(run_dir, BEST_CKPT))
+
+@pytest.mark.parametrize("sizes,accum,expected", [([2, 2, 1], 2, 2), ([1], 4, 1)])
+def test_accumulation_flushes_and_normalizes_partial_groups(sizes, accum, expected):
+    cfg = _cfg(batch_size=2, grad_accum_steps=accum, lr_warmup_steps=0,
+               learning_rate=0.1, grad_clip=100.0)
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    model.loss = lambda x: model(x).mean()
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    scaler = GradScaler(torch.device("cpu"), enabled=False)
+    ema = EMA(model, 0.9)
+    _, steps = train_epoch(model, [torch.ones(n, 1) for n in sizes], opt, scaler, ema, cfg, 0, 0)
+    assert steps == ema.steps == expected
+    assert model.weight.item() == pytest.approx(1 - 0.1 * expected)
+
+
+def test_empty_epoch_rejected():
+    cfg = _cfg()
+    model = build_ddpm(cfg)
+    with pytest.raises(ValueError, match="empty"):
+        train_epoch(model, [], build_optimizer(cfg, model), GradScaler(torch.device("cpu"), False),
+                    EMA(model, .9), cfg, 0, 0)
+
+
+def test_graph_gradient_storage_survives_epoch_boundary():
+    cfg = _cfg(grad_accum_steps=1, lr_warmup_steps=0, learning_rate=.1, grad_clip=100.)
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1.)
+    opt = torch.optim.SGD(model.parameters(), lr=.1)
+
+    class Replay:
+        enabled = True
+        grad = None
+
+        def step(self, x):
+            if self.grad is None:
+                model.weight.grad = torch.zeros_like(model.weight)
+                self.grad = model.weight.grad
+            self.grad.fill_(1.)
+            return torch.tensor(1.)
+
+    graph = Replay()
+    scaler = GradScaler(torch.device("cpu"), False)
+    ema = EMA(model, .9)
+    for epoch in range(2):
+        train_epoch(model, [torch.ones(1, 1)], opt, scaler, ema, cfg, epoch, epoch, graph)
+    assert model.weight.item() == pytest.approx(.8)
+    assert model.weight.grad is graph.grad
+
+
+def test_failed_checkpoint_write_preserves_previous(tmp_path, monkeypatch):
+    cfg = _cfg()
+    model = build_ddpm(cfg)
+    args = (str(tmp_path), "last.pt", cfg, model, build_optimizer(cfg, model),
+            GradScaler(torch.device("cpu"), False), EMA(model, .9), 0, 1, 1.)
+    path = save_checkpoint(*args)
+    before = Path(path).read_bytes()
+
+    def interrupted(payload, stream):
+        stream.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(torch, "save", interrupted)
+    with pytest.raises(OSError, match="disk full"):
+        save_checkpoint(*args)
+    assert Path(path).read_bytes() == before
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_mps_rng_checkpoint_roundtrip(tmp_path, monkeypatch):
+    state = torch.tensor([1, 2, 3], dtype=torch.uint8)
+    restored = []
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(torch.mps, "get_rng_state", lambda: state)
+    monkeypatch.setattr(torch.mps, "set_rng_state", restored.append)
+    cfg = _cfg()
+    model = build_ddpm(cfg)
+    objects = (model, build_optimizer(cfg, model), GradScaler(torch.device("cpu"), False), EMA(model, .9))
+    path = save_checkpoint(str(tmp_path), "last.pt", cfg, *objects, 0, 1, 1.)
+    load_checkpoint(path, cfg, *objects)
+    assert torch.equal(restored[0], state)

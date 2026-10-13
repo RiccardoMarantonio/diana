@@ -10,8 +10,10 @@ so an ephemeral Colab session can pick up exactly where it died.
 
 import dataclasses
 import json
+import math
 import os
 import shutil
+import tempfile
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
@@ -104,16 +106,27 @@ def save_checkpoint(
         # of starting a fresh (re-seeded) one -- otherwise epoch-count vs
         # continuous-run trajectories diverge. The timestep/noise draws happen
         # on the device, so on CUDA its generator must travel too (the CPU
-        # state alone does not cover it). MPS draws are covered by the CPU
-        # state.
+        # state alone does not cover it). MPS has its own generator too.
         "rng_state": torch.get_rng_state(),
         "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        "mps_rng_state": torch.mps.get_rng_state() if torch.backends.mps.is_available() else None,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "ema": ema.state_dict(),
     }
-    torch.save(payload, path)
+    # Publish only a complete checkpoint; failed writes leave the previous one intact.
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=run_dir, suffix=".tmp", delete=False) as stream:
+            temp_path = stream.name
+            torch.save(payload, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and os.path.exists(temp_path):
+            os.unlink(temp_path)
     return path
 
 
@@ -127,10 +140,20 @@ def load_checkpoint(
 ) -> tuple[int, int, float]:
     """Restore every checkpointed piece into the live objects; return counters."""
     payload = torch.load(path, map_location="cpu")
+    # Refuse silent changes to the learned distribution or network semantics.
+    immutable = ("category", "img_size", "base_channels", "channel_mults", "num_res_blocks",
+                 "attention_resolutions", "dropout", "num_timesteps", "schedule_type",
+                 "beta_start", "beta_end", "schedule_param", "objective")
+    changed = [key for key in immutable if payload["config"].get(key) != getattr(config, key)]
+    if changed:
+        raise ValueError(f"resume configuration differs from checkpoint: {', '.join(changed)}")
     torch.set_rng_state(payload["rng_state"])
     cuda_state = payload.get("cuda_rng_state")  # absent in older checkpoints
     if cuda_state is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state(cuda_state)
+    mps_state = payload.get("mps_rng_state")
+    if mps_state is not None and torch.backends.mps.is_available():
+        torch.mps.set_rng_state(mps_state)
     model.load_state_dict(payload["model"])
     optimizer.load_state_dict(payload["optimizer"])
     scaler.load_state_dict(payload["scaler"])
@@ -168,76 +191,65 @@ def train_epoch(
     global_step: int,
     graph: CudaGraphStep | None = None,
 ) -> tuple[float, int]:
-    """One epoch, accumulating grads over ``grad_accum_steps`` micro-batches.
+    """Train one epoch, including partial accumulation groups and small batches.
 
-    Returns ``(mean_loss, global_step)`` where ``mean_loss`` is the mean over
-    micro-batches. Each micro-loss is divided by the accumulation factor up
-    front so the summed gradient is the gradient of the mean loss, while
-    reported loss stays on the true (unscaled) scale.
-
-    With ``use_cuda_graphs`` the forward+backward is replaced by a replayed
-    ``CUDAGraph`` (see :class:`CudaGraphStep`); the optimizer clip/step/update
-    still runs every micro-batch because accumulation is disabled in that mode.
+    Gradients are normalized by the number of samples in each update, so a
+    partial final batch has the same weighting as the corresponding large batch.
+    Graphed training preserves the addresses used by captured backward kernels.
     """
+    model.train()
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
     device = next(model.parameters()).device
     accum = config.grad_accum_steps
-    epoch_loss = 0.0
+    epoch_loss = torch.zeros((), device=device)
     micro = 0
-    optimizer.zero_grad(set_to_none=True)
+    group_samples = 0
+    optimizer.zero_grad(set_to_none=not (graph is not None and graph.enabled))
+
+    def update(samples: int, graphed: bool) -> None:
+        nonlocal global_step
+        if not graphed:
+            # Loss scaling stays bounded for AMP; correct the last short group
+            # before unscale/clip, without touching the scaler's live scale.
+            factor = accum * config.batch_size / samples
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.mul_(factor)
+        for group in optimizer.param_groups:
+            group["lr"] = lr_at_step(global_step, config)
+        scaler.clip_grad_norm_(optimizer, config.grad_clip, sync=False)
+        scaler.step(optimizer)
+        scaler.update()
+        ema.update(model)
+        optimizer.zero_grad(set_to_none=not (graph is not None and graph.enabled))
+        global_step += 1
 
     for micro, batch in enumerate(loader, 1):
         x = batch.to(device, non_blocking=config.pin_memory)
-
-        if graph is not None and graph.enabled:
-            optimizer.zero_grad(set_to_none=False)
+        graphed = graph is not None and graph.enabled
+        if graphed:
+            assert graph is not None
             loss = graph.step(x)
-            forward_loss = float(loss.detach())
-            epoch_loss += forward_loss
-            for group in optimizer.param_groups:
-                group["lr"] = lr_at_step(global_step, config)
-            scaler.clip_grad_norm_(optimizer, config.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            # Unconditional: a scaler retval is not a reliable "did we step"
-            # signal (None for AdamW even on success), and averaging unchanged
-            # weights during an inf-skip is benign.
-            ema.update(model)
-            global_step += 1
+        else:
+            with autocast(device, enabled=config.use_amp):
+                loss = model.loss(x)
+            scaler.backward(loss * (len(x) / (accum * config.batch_size)))
+        epoch_loss.add_(loss.detach())
+        group_samples += len(x)
+        if graphed or micro % accum == 0:
+            update(group_samples, graphed)
+            group_samples = 0
             if global_step % config.log_every_n_steps == 0:
-                lr = optimizer.param_groups[0]["lr"]
-                print(
-                    f"[epoch {epoch}] step {global_step} | loss {forward_loss:.4f} "
-                    f"| lr {lr:.2e} | clipped grad_norm to {config.grad_clip} | greplay=CUDA"
-                )
-            del loss, x
-            continue
+                print(f"[epoch {epoch}] step {global_step} | loss {float(loss.detach()):.4f} "
+                      f"| lr {optimizer.param_groups[0]['lr']:.2e}")
 
-        with autocast(device, enabled=config.use_amp):
-            loss = model.loss(x)
-        forward_loss = float(loss.detach())
-        epoch_loss += forward_loss
-
-        scaler.backward(loss / accum)
-
-        if micro % accum == 0:
-            for group in optimizer.param_groups:
-                group["lr"] = lr_at_step(global_step, config)
-            scaler.clip_grad_norm_(optimizer, config.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            ema.update(model)
-            optimizer.zero_grad(set_to_none=True)
-            global_step += 1
-
-            if global_step % config.log_every_n_steps == 0:
-                lr = optimizer.param_groups[0]["lr"]
-                print(
-                    f"[epoch {epoch}] step {global_step} | loss {forward_loss:.4f} "
-                    f"| lr {lr:.2e} | clipped grad_norm to {config.grad_clip}"
-                )
-        del loss, x
-
-    return epoch_loss / max(1, micro), global_step
+    if micro == 0:
+        raise ValueError("training loader is empty; reduce batch_size or provide more images")
+    if group_samples:
+        update(group_samples, False)
+    return float(epoch_loss / micro), global_step
 
 
 def run_training(config: Config, device: torch.device) -> dict:
@@ -251,7 +263,7 @@ def run_training(config: Config, device: torch.device) -> dict:
 
     run_dir = os.path.join(
         config.checkpoint_dir,
-        f"{config.category}-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}",
+        f"{config.category}-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S-%f')}",
     )
     _provenance(config, run_dir)
 
@@ -278,15 +290,9 @@ def run_training(config: Config, device: torch.device) -> dict:
     print(
         f"[start] device={device.type} amp={'on' if scaler.enabled else 'off'} "
         f"cuda_graphs={'on' if graph.enabled else 'off'} "
-        f"steps/epoch={len(loader) // config.grad_accum_steps} "
+        f"steps/epoch={math.ceil(len(loader) / config.grad_accum_steps)} "
         f"checkpoints -> {run_dir}"
     )
-    if config.use_cuda_graphs and config.dropout > 0:
-        print(
-            f"[warn] use_cuda_graphs with dropout={config.dropout}: dropout masks "
-            "are frozen at capture time; use dropout=0 for parity with eager training"
-        )
-
     results: dict = {"losses": [], "best_loss": best_loss}
     for epoch in range(start_epoch, config.epochs):
         loss, global_step = train_epoch(

@@ -79,3 +79,46 @@ class TestGraphedScaler:
             pass
         else:
             raise AssertionError("expected ValueError for use_cuda_graphs with grad_accum_steps > 1")
+
+def test_failed_capture_runs_clean_eager_backward(monkeypatch):
+    cfg = _cfg(dropout=0.)
+    model = build_ddpm(cfg)
+    scaler = GradScaler(torch.device("cpu"), False)
+    graph = CudaGraphStep(model, torch.device("cpu"), scaler, False)
+    graph._enabled = True
+
+    def fail(*args):
+        for p in model.parameters():
+            p.grad = torch.full_like(p, float("nan"))
+        graph._enabled = False
+
+    monkeypatch.setattr(graph, "_capture", fail)
+    loss = graph.step(torch.randn(2, 3, 16, 16))
+    assert torch.isfinite(loss)
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    assert not graph.enabled
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("amp", [False, True])
+def test_cuda_graph_updates_weights_across_epochs(amp):
+    from diana.models.ema import EMA
+    from diana.train import build_optimizer, train_epoch
+    cfg = _cfg(dropout=0., grad_accum_steps=1, use_cuda_graphs=True,
+               use_amp=amp, lr_warmup_steps=0)
+    device = torch.device("cuda")
+    model = build_ddpm(cfg).to(device)
+    scaler = GradScaler(device, amp)
+    opt = build_optimizer(cfg, model)
+    ema = EMA(model, .9)
+    graph = CudaGraphStep(model, device, scaler, True)
+    if amp:
+        scaler._scaler.scale(torch.ones((), device=device))
+        scaler._scaler.update(new_scale=1.)
+    batches = [torch.randn(4, 3, 16, 16) for _ in range(2)]
+    step = 0
+    for epoch in range(2):
+        before = next(model.parameters()).detach().clone()
+        _, step = train_epoch(model, batches, opt, scaler, ema, cfg, epoch, step, graph)
+        assert graph.active
+        assert not torch.equal(before, next(model.parameters()))
