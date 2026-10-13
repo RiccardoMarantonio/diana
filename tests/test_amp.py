@@ -90,6 +90,57 @@ class _NoneRetValScaler:
         pass
 
 
+class _FoundInfScaler(_NoneRetValScaler):
+    """Exposes torch's per-optimizer found_inf bookkeeping, one flag per step."""
+
+    def __init__(self):
+        self._per_optimizer_states = {}
+
+    def scale(self, loss):
+        return loss
+
+    def set_found_inf(self, flag: float) -> None:
+        self._per_optimizer_states = {0: {"found_inf_per_device": {"cpu": torch.tensor(flag)}}}
+
+
+class TestSkipCounter:
+    def _armed(self):
+        model = torch.nn.Linear(4, 1)
+        opt = _make_optimizer(model)
+        scaler = GradScaler(torch.device("cpu"), enabled=False)
+        scaler._enabled = True  # force the CUDA/AMP code path
+        scaler._scaler = _FoundInfScaler()
+        return model, opt, scaler
+
+    def _step(self, model, opt, scaler, found_inf: float) -> None:
+        scaler.backward((model(torch.randn(8, 4)) ** 2).mean())
+        scaler.clip_grad_norm_(opt, max_norm=1.0)
+        scaler._scaler.set_found_inf(found_inf)
+        scaler.step(opt)
+        scaler.update()
+
+    def test_counts_only_skipped_steps(self):
+        model, opt, scaler = self._armed()
+        for flag in (0.0, 1.0, 0.0, 1.0, 1.0):
+            self._step(model, opt, scaler, flag)
+        assert scaler.steps_skipped() == 3
+
+    def test_zero_when_disabled(self):
+        scaler = GradScaler(torch.device("cpu"), enabled=True)
+        assert scaler.steps_skipped() == 0
+
+    def test_tolerates_scaler_without_private_state(self):
+        model = torch.nn.Linear(4, 1)
+        opt = _make_optimizer(model)
+        scaler = GradScaler(torch.device("cpu"), enabled=False)
+        scaler.backward((model(torch.randn(8, 4)) ** 2).mean())
+        scaler.clip_grad_norm_(opt, max_norm=1.0)
+        scaler._enabled = True
+        scaler._scaler = _NoneRetValScaler()  # no _per_optimizer_states at all
+        assert scaler.step(opt) is True
+        assert scaler.steps_skipped() == 0
+
+
 class TestStepReturnValueContract:
     def test_step_true_even_when_inner_scaler_returns_none(self):
         """The wrapper must not turn torch's None retval into False.

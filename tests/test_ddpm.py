@@ -137,6 +137,15 @@ def test_reconstruct_first_label_is_t_start(ddpm):
     assert labels[-1] == 0
 
 
+@pytest.mark.parametrize("n", range(1, 101))
+def test_stride_times_always_yields_exactly_n_distinct_steps(ddpm, n):
+    """Pins that striding never silently drops steps for any legal num_steps."""
+    times = ddpm._stride_times(n)
+    assert len(times) == n
+    assert times[0] == 99 and (n == 1 or times[-1] == 0)
+    assert all(a > b for a, b in itertools.pairwise(times.tolist()))
+
+
 def test_objective_guard():
     with pytest.raises(NotImplementedError):
         DDPM(None, None, objective="pred_x0")

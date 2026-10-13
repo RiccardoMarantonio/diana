@@ -50,6 +50,9 @@ class GradScaler:
         # when disabled) so attribute types are well-defined for checkers.
         self._scaler = _TorchGradScaler("cuda", enabled=self._enabled)
         self._unscaled = False
+        # GPU-resident running count of inf/nan-skipped steps; accumulated
+        # asynchronously so counting adds no per-step host sync.
+        self._skipped: torch.Tensor | None = None
 
     @property
     def enabled(self) -> bool:
@@ -85,7 +88,29 @@ class GradScaler:
             )
         self._unscaled = False
         self._scaler.step(optimizer)  # retval unreliable (None for AdamW)
+        self._count_skips()
         return True
+
+    def _count_skips(self) -> None:
+        """Fold this step's ``found_inf`` flags into the skip counter.
+
+        Reads torch's per-optimizer state (private, so guarded): if it ever
+        changes shape we silently stop counting rather than break training.
+        """
+        if not self._enabled:
+            return
+        states = getattr(self._scaler, "_per_optimizer_states", None)
+        if not isinstance(states, dict):
+            return
+        for state in states.values():
+            for found_inf in state.get("found_inf_per_device", {}).values():
+                if self._skipped is None:
+                    self._skipped = torch.zeros((), device=found_inf.device)
+                self._skipped += found_inf.to(self._skipped.device).float().sum()
+
+    def steps_skipped(self) -> int:
+        """Optimizer steps dropped for inf/nan grads so far (syncs the device)."""
+        return 0 if self._skipped is None else int(self._skipped.item())
 
     def update(self) -> None:
         """Adjust the scale factor after each optimizer step (CUDA only)."""

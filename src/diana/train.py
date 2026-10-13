@@ -11,6 +11,7 @@ so an ephemeral Colab session can pick up exactly where it died.
 import dataclasses
 import json
 import os
+import shutil
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
@@ -99,10 +100,14 @@ def save_checkpoint(
         "epoch": epoch,
         "global_step": global_step,
         "best_loss": best_loss,
-        # RNG state so a resume re-enters the same data stream instead of
-        # starting a fresh (re-seeded) one -- otherwise epoch-count vs
-        # continuous-run trajectories diverge.
+        # RNG state so a resume re-enters the same stochastic stream instead
+        # of starting a fresh (re-seeded) one -- otherwise epoch-count vs
+        # continuous-run trajectories diverge. The timestep/noise draws happen
+        # on the device, so on CUDA its generator must travel too (the CPU
+        # state alone does not cover it). MPS draws are covered by the CPU
+        # state.
         "rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
@@ -123,11 +128,21 @@ def load_checkpoint(
     """Restore every checkpointed piece into the live objects; return counters."""
     payload = torch.load(path, map_location="cpu")
     torch.set_rng_state(payload["rng_state"])
+    cuda_state = payload.get("cuda_rng_state")  # absent in older checkpoints
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state(cuda_state)
     model.load_state_dict(payload["model"])
     optimizer.load_state_dict(payload["optimizer"])
     scaler.load_state_dict(payload["scaler"])
     ema.load_state_dict(payload["ema"])
     return payload["epoch"], payload["global_step"], payload["best_loss"]
+
+
+def resolve_resume_path(resume_from: str) -> str:
+    """Checkpoint file to load: a directory means its ``last.pt``; a file is used as-is."""
+    if os.path.isdir(resume_from):
+        return os.path.join(resume_from, LAST_CKPT)
+    return resume_from
 
 
 def _provenance(config: Config, run_dir: str) -> None:
@@ -155,9 +170,10 @@ def train_epoch(
 ) -> tuple[float, int]:
     """One epoch, accumulating grads over ``grad_accum_steps`` micro-batches.
 
-    Returns ``(mean_loss, global_step)``. Each micro-loss is divided by the
-    accumulation factor up front so the summed gradient is the gradient of the
-    mean loss, while reported loss stays on the true (unscaled) scale.
+    Returns ``(mean_loss, global_step)`` where ``mean_loss`` is the mean over
+    micro-batches. Each micro-loss is divided by the accumulation factor up
+    front so the summed gradient is the gradient of the mean loss, while
+    reported loss stays on the true (unscaled) scale.
 
     With ``use_cuda_graphs`` the forward+backward is replaced by a replayed
     ``CUDAGraph`` (see :class:`CudaGraphStep`); the optimizer clip/step/update
@@ -166,7 +182,7 @@ def train_epoch(
     device = next(model.parameters()).device
     accum = config.grad_accum_steps
     epoch_loss = 0.0
-    ran = 0
+    micro = 0
     optimizer.zero_grad(set_to_none=True)
 
     for micro, batch in enumerate(loader, 1):
@@ -187,7 +203,6 @@ def train_epoch(
             # weights during an inf-skip is benign.
             ema.update(model)
             global_step += 1
-            ran += 1
             if global_step % config.log_every_n_steps == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 print(
@@ -213,7 +228,6 @@ def train_epoch(
             ema.update(model)
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
-            ran += 1
 
             if global_step % config.log_every_n_steps == 0:
                 lr = optimizer.param_groups[0]["lr"]
@@ -223,7 +237,7 @@ def train_epoch(
                 )
         del loss, x
 
-    return epoch_loss / max(1, ran), global_step
+    return epoch_loss / max(1, micro), global_step
 
 
 def run_training(config: Config, device: torch.device) -> dict:
@@ -247,13 +261,18 @@ def run_training(config: Config, device: torch.device) -> dict:
     start_epoch = 0
     best_loss = float("inf")
     if config.resume_from:
-        resume_dir = config.resume_from if os.path.isdir(config.resume_from) else os.path.dirname(config.resume_from)
+        resume_path = resolve_resume_path(config.resume_from)
         start_epoch, global_step, best_loss = load_checkpoint(
-            os.path.join(resume_dir, LAST_CKPT),
-            config, model, optimizer, scaler, ema,
+            resume_path, config, model, optimizer, scaler, ema,
         )
         start_epoch += 1  # checkpoint holds the finished epoch
-        print(f"[resume] continuing from epoch {start_epoch}, step {global_step}")
+        print(f"[resume] continuing from {resume_path}: epoch {start_epoch}, step {global_step}")
+        # best.pt must hold the weights of the best epoch, which live in the
+        # previous run's best.pt -- not in last.pt. Carry it over so the new
+        # run dir is self-contained even if the tail never beats it.
+        prev_best = os.path.join(os.path.dirname(resume_path), BEST_CKPT)
+        if os.path.exists(prev_best):
+            shutil.copy2(prev_best, os.path.join(run_dir, BEST_CKPT))
 
     loader = make_dataloader(config)
     print(
@@ -288,6 +307,9 @@ def run_training(config: Config, device: torch.device) -> dict:
         print(f"[epoch {epoch}] mean loss {loss:.4f} | best {best_loss:.4f}")
 
     results["best_loss"] = best_loss
+    results["amp_steps_skipped"] = scaler.steps_skipped()
+    if scaler.enabled:
+        print(f"[amp] optimizer steps skipped for inf/nan grads: {results['amp_steps_skipped']}")
     return results
 
 
