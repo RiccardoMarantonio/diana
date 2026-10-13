@@ -67,7 +67,12 @@ bash t4.sh              # 100 total epochs, at most 200 unique test images
 bash t4.sh 3 32         # local smoke: 3 epochs, 32-sample eval
 bash t4.sh 100 200 configs/bottle.toml
 bash t4.sh 100 200 all  # train/evaluate all configs, one after another
+./run_all_configs.sh 100 200  # explicit runner over configs/*.toml
 ```
+
+`run_all_configs.sh` takes the same epoch and image-limit arguments as `t4.sh`
+and runs the full workflow once per TOML config. It stops if any category
+fails. `FRESH=1` and `T_STARTS` are forwarded to each run.
 
 `data/` is gitignored, so the script re-downloads it on a fresh machine. If a
 session dies mid-training, rerunning resumes the latest category checkpoint.
