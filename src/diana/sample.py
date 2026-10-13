@@ -196,7 +196,7 @@ def run_inference(
         good = float(scores[labels == 0].mean())
         bad = float(scores[labels == 1].mean())
         report = {
-            "tag": tag, "t_start": t_start, "num_steps": num_steps,
+            "category": cfg.category, "tag": tag, "t_start": t_start, "num_steps": num_steps,
             "device": device.type, "n": len(scores),
             "ema_applied": use_ema, "seed": cfg.seed if seed is None else seed,
             "image_auroc": round(image_auc, 6),

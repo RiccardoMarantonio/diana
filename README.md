@@ -57,13 +57,16 @@ uv run python -m diana.sample --run runs/hazelnut-<timestamp> --pixel
 ## One-shot run (Colab T4 or local)
 
 `t4.sh` is device-agnostic (`device = "auto"` picks CUDA on Colab, MPS on
-Apple Silicon) and self-contained — benchmark, train, then sweep `t_start`
-and write the pixel-level evaluation:
+Apple Silicon). It benchmarks and trains the selected category, evaluates
+image- and pixel-level AUROC across `t_start`, then writes a CSV and SVG chart.
+Pass `all` as the config to run every category config in `configs/`:
 
 ```bash
 git clone https://github.com/RiccardoMarantonio/diana.git && cd diana
 bash t4.sh              # 100 epochs, 200-sample eval (Colab)
 bash t4.sh 3 32         # local smoke: 3 epochs, 32-sample eval
+bash t4.sh 100 200 configs/bottle.toml
+bash t4.sh 100 200 all  # train/evaluate all configs, one after another
 ```
 
 `data/` is gitignored, so the script re-downloads it on a fresh machine. If a
@@ -83,6 +86,11 @@ uv run python -m diana.train --config configs/hazelnut.toml \
     --use_amp --cudnn_benchmark --epochs 100
 uv run python -m diana.sample --run runs/hazelnut-<ts> --pixel --limit 200
 ```
+
+Each run stores per-`t_start` reports in `runs/<category>-<timestamp>/evaluations/`.
+The `evaluation.csv` contains image AUROC, pixel AUROC, and mean anomaly scores
+for good and defective images; `evaluation.svg` plots image and pixel AUROC.
+Set `T_STARTS="50 100 150 200"` before calling `t4.sh` to change the sweep.
 
 Notes:
 
