@@ -10,8 +10,8 @@ Pipeline (the SDEdit workhorse from ``ddpm.reconstruct``):
 5. Image-level AUROC vs the good/anomalous split; save a visual grid.
 
 ``t_start`` is the healing-vs-faithfulness dial. On the 1000-step linear
-schedule, ᾱ drops to ~0.37 at t=100 and ~0.007 at t=500, so the useful
-operating range is roughly t in [50, 200]; the default is 100.
+schedule, ᾱ is ~0.895 at t=100 and ~0.0778 at t=500. Choose the
+operating point before final testing; the checkpoint supplies the default.
 
 Usage::
 
@@ -71,7 +71,7 @@ def auc_sorted(scores: torch.Tensor, labels: torch.Tensor) -> float:
     (Mann-Whitney U). Used for pixel-wise scoring where the pair loop in
     :func:`auroc` would be quadratic in the number of pixels.
     """
-    y = labels.to(torch.bool)
+    y = labels.cpu().to(torch.bool)
     p = int(y.sum())
     q = int((~y).sum())
     if p == 0 or q == 0:
@@ -118,8 +118,12 @@ def _colorize(amap: torch.Tensor) -> np.ndarray:
 
 def make_grid(shown: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], cols: int = 4) -> np.ndarray:
     """Rows of orig | recon | heatmap tiles joined into one image (H, W, 3)."""
+    if not shown or cols < 1:
+        raise ValueError("grid requires samples and a positive column height")
     tiles = [np.concatenate([_tile(o), _tile(r), _colorize(a)], axis=1) for o, r, a in shown]
-    rows = [np.concatenate(tiles[i : i + cols], axis=0) for i in range(0, len(tiles), cols)]
+    height = min(cols, len(tiles))
+    tiles.extend(np.zeros_like(tiles[0]) for _ in range((-len(tiles)) % height))
+    rows = [np.concatenate(tiles[i : i + height], axis=0) for i in range(0, len(tiles), height)]
     return np.concatenate(rows, axis=1)
 
 
@@ -128,15 +132,17 @@ def run_inference(
     tag: str,
     t_start: int,
     num_steps: int,
-    out: str,
+    out: str | None,
     limit: int | None,
     pixel: bool = False,
     use_ema: bool = True,
     seed: int | None = None,
 ) -> dict:
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be positive")
     cfg, model, ema = load_checkpoint_run(run_dir, tag)
     device = resolve_device(cfg.device)
-    model.to(device)
+    model.to(device).eval()
     if use_ema:
         ema.apply(model)  # sampling scores come from the EMA weights
     # SDEdit draws fresh noise per reconstruction; pin the RNG so the same
@@ -146,7 +152,7 @@ def run_inference(
     set_seed(cfg.seed if seed is None else seed)
     try:
         ds = MVTecEvalDataset(cfg.data_path, cfg.category, img_size=cfg.img_size)
-        indices = list(range(len(ds))) if limit is None else np.linspace(0, len(ds) - 1, limit).astype(int)
+        indices = list(range(len(ds))) if limit is None else np.linspace(0, len(ds) - 1, min(limit, len(ds))).astype(int)
         batch = cfg.batch_size
 
         all_scores, all_labels = [], []
@@ -167,10 +173,8 @@ def run_inference(
             all_scores.append(scores.cpu())
             all_labels.append(labels)
             if pixel:
-                sel = labels == 1
-                if sel.any():
-                    pixel_scores.append(amap[sel].cpu().flatten())
-                    pixel_masks.append(masks[sel].cpu().flatten())
+                pixel_scores.append(amap.cpu().flatten())
+                pixel_masks.append(masks.flatten())
             for k in range(x.shape[0]):
                 if len(shown) < 8:
                     shown.append((x[k].cpu(), recon[k].cpu(), amap[k].cpu()))
@@ -182,12 +186,11 @@ def run_inference(
 
         pixel_auc = None
         if pixel:
-            if pixel_scores:
-                pixel_auc = auc_sorted(
-                    torch.cat(pixel_scores), torch.cat(pixel_masks)
-                )
+            mask_labels = torch.cat(pixel_masks)
+            if mask_labels.any() and not mask_labels.bool().all():
+                pixel_auc = auc_sorted(torch.cat(pixel_scores), mask_labels)
             else:
-                print("[warn] --pixel given but no defective images selected; skipping pixel AUROC")
+                print("[warn] pixel AUROC undefined: selected masks contain only one class")
 
         out = out or os.path.join(run_dir, f"anomaly_{tag}_t{t_start}.png")
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
@@ -201,6 +204,7 @@ def run_inference(
             "ema_applied": use_ema, "seed": cfg.seed if seed is None else seed,
             "image_auroc": round(image_auc, 6),
             "pixel_auroc": round(pixel_auc, 6) if pixel_auc is not None else None,
+            "pixel_scope": "all_test_images" if pixel else None,
             "good_mean": round(good, 6), "defect_mean": round(bad, 6),
             "grid": os.path.relpath(out),
         }
@@ -231,7 +235,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out", default=None, help="Output grid PNG path")
     parser.add_argument("--limit", type=int, default=64, help="Max test images to score")
     parser.add_argument("--pixel", action="store_true",
-                        help="Also score pixel-level AUROC against ground-truth masks (defective images only)")
+                        help="Also score pixel-level AUROC against ground-truth masks (all selected images)")
     parser.add_argument("--no_ema", action="store_true",
                         help="Score with the live (non-EMA) weights; for checkpoints whose EMA never advanced")
     parser.add_argument("--seed", type=int, default=None,
@@ -240,7 +244,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     cfg, _, _ = load_checkpoint_run(args.run, args.tag)
-    num_steps = args.num_steps or cfg.sample_timesteps
+    num_steps = cfg.sample_timesteps if args.num_steps is None else args.num_steps
     t_start = args.t_start if args.t_start is not None else cfg.eval_t_start_effective
     run_inference(args.run, args.tag, t_start, num_steps, args.out, args.limit,
                   pixel=args.pixel, use_ema=not args.no_ema, seed=args.seed)

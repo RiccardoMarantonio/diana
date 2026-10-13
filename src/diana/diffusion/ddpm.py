@@ -117,7 +117,7 @@ class DDPM(nn.Module):
         return x
 
     def _stride_times(self, num_steps: int | None) -> torch.Tensor:
-        steps = num_steps or self.schedule.num_timesteps
+        steps = self.schedule.num_timesteps if num_steps is None else num_steps
         if not 0 < steps <= self.schedule.num_timesteps:
             raise ValueError(f"num_steps must be in (0, {self.schedule.num_timesteps}], got {steps}")
         # Descending, evenly spaced buffer indices; endpoints inclusive.

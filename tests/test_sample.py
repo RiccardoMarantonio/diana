@@ -220,3 +220,46 @@ class TestSeededSampling:
                       limit=4, seed=3)
         with open(os.path.join(run_dir, "eval.json")) as f:
             assert json.load(f)["seed"] == 3
+
+@pytest.mark.parametrize("count", [1, 4, 5, 6, 7, 8])
+def test_grid_pads_partial_columns(count):
+    tile = (torch.zeros(3, 8, 8), torch.zeros(3, 8, 8), torch.zeros(8, 8))
+    grid = make_grid([tile] * count)
+    assert grid.shape == (min(count, 4) * 8, ((count + 3) // 4) * 24, 3)
+
+
+def test_inference_disables_dropout_and_caps_limit(tmp_path, monkeypatch):
+    run_dir = TestSeededSampling()._ckpt(tmp_path)
+    modes = []
+    original = torch.nn.Dropout.forward
+
+    def forward(self, x):
+        modes.append(self.training)
+        return original(self, x)
+
+    monkeypatch.setattr(torch.nn.Dropout, "forward", forward)
+    report = run_inference(run_dir, "best", 8, 8, None, limit=200, pixel=True)
+    assert report["n"] == 4
+    assert modes and not any(modes)
+    assert report["pixel_scope"] == "all_test_images"
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_inference_rejects_invalid_limits(limit):
+    with pytest.raises(ValueError, match="limit"):
+        run_inference("unused", "best", 8, 8, None, limit)
+
+
+def test_pixel_metric_includes_normal_images(tmp_path, monkeypatch):
+    run_dir = TestSeededSampling()._ckpt(tmp_path)
+    observed = []
+    from diana import sample
+    original = sample.auc_sorted
+
+    def capture(scores, masks):
+        observed.append(scores.numel())
+        return original(scores, masks)
+
+    monkeypatch.setattr(sample, "auc_sorted", capture)
+    run_inference(run_dir, "best", 8, 8, None, limit=4, pixel=True)
+    assert observed == [4 * 16 * 16]
