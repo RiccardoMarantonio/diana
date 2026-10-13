@@ -125,6 +125,12 @@ def fetch_one(
             f"sha256 mismatch for {rel_path}: got {digest.hexdigest()}, "
             f"expected {expected_sha256}"
         )
+    actual_size = os.path.getsize(tmp)
+    if expected_size is not None and actual_size != expected_size:
+        os.remove(tmp)
+        raise RuntimeError(
+            f"size mismatch for {rel_path}: got {actual_size}, expected {expected_size}"
+        )
     os.replace(tmp, local)
     return rel_path, "ok"
 

@@ -9,7 +9,7 @@ Serves the training loop a DataLoader regardless of the data source:
 import os
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from diana.config import Config
 from diana.data.mvtec import MVTecDataset
@@ -28,12 +28,34 @@ class SyntheticDataset(Dataset):
     def __len__(self) -> int:
         return self._length
 
-    def __getitem__(self, index: int) -> torch.Tensor:
+    def __getitem__(self, index: int | tuple[int, int]) -> torch.Tensor:
+        epoch, item = index if isinstance(index, tuple) else (0, index)
+        generator = torch.Generator().manual_seed(self._config.seed + epoch * self._length + item)
         return torch.rand(
             self._config.img_size,
             self._config.img_size,
             3,
+            generator=generator,
         ).mul_(2.0).sub_(1.0).permute(2, 0, 1)
+
+
+class EpochSampler(Sampler):
+    """Pass epoch with each index so persistent workers need no mutable RNG state."""
+
+    def __init__(self, length: int, seed: int):
+        self.length = length
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        return iter((self.epoch, i) for i in torch.randperm(self.length, generator=generator).tolist())
 
 
 def make_dataloader(config: Config) -> DataLoader:
@@ -45,6 +67,7 @@ def make_dataloader(config: Config) -> DataLoader:
             config.category,
             img_size=config.img_size,
             augment=config.augment_hflip,
+            seed=config.seed,
         )
     else:
         raise RuntimeError(
@@ -52,6 +75,8 @@ def make_dataloader(config: Config) -> DataLoader:
             f"random-tensor smoke run, or fetch a category with: "
             f"python -m diana.data.download --categories {config.category}"
         )
+    if config.use_cuda_graphs and len(dataset) < config.batch_size:
+        raise ValueError("CUDA graphs require at least one full batch; reduce batch_size")
     return DataLoader(
         dataset,
         batch_size=config.batch_size,
@@ -63,5 +88,7 @@ def make_dataloader(config: Config) -> DataLoader:
         persistent_workers=config.persistent_workers and config.num_workers > 0,
         pin_memory=config.pin_memory,
         worker_init_fn=worker_init_fn,
-        drop_last=True,
+        sampler=EpochSampler(len(dataset), config.seed),
+        generator=torch.Generator().manual_seed(config.seed),
+        drop_last=config.use_cuda_graphs,
     )

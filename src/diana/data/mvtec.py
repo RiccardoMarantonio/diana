@@ -52,7 +52,7 @@ def _load_mask(path: str, resize: int, crop: int) -> torch.Tensor:
 class MVTecDataset(Dataset):
     """Training split (defect-free ``good`` images) of one MVTec category."""
 
-    def __init__(self, root: str, category: str, img_size: int = 64, augment: bool = False):
+    def __init__(self, root: str, category: str, img_size: int = 64, augment: bool = False, seed: int = 0):
         if category not in MVTEC_CATEGORIES:
             raise ValueError(
                 f"unknown MVTec category {category!r}; expected one of {sorted(MVTEC_CATEGORIES)}"
@@ -73,13 +73,16 @@ class MVTecDataset(Dataset):
         self._resize = 2 * img_size
         self._crop = img_size
         self._augment = augment
+        self._seed = seed
 
     def __len__(self) -> int:
         return len(self._paths)
 
-    def __getitem__(self, index: int) -> torch.Tensor:
-        out = _load_image(self._paths[index], self._resize, self._crop)
-        if self._augment and torch.rand(1).item() < 0.5:
+    def __getitem__(self, index: int | tuple[int, int]) -> torch.Tensor:
+        epoch, item = index if isinstance(index, tuple) else (0, index)
+        generator = torch.Generator().manual_seed(self._seed + epoch * len(self) + item)
+        out = _load_image(self._paths[item], self._resize, self._crop)
+        if self._augment and torch.rand(1, generator=generator).item() < 0.5:
             out = torch.flip(out, dims=[2])
         return out
 

@@ -204,7 +204,7 @@ class TestMVTecDataset:
                      batch_size=2, num_workers=0)
         loader = make_dataloader(cfg)
         batches = list(loader)
-        assert len(batches) == 1
+        assert len(batches) == 2
         assert batches[0].shape == (2, 3, 16, 16)
 
     def test_loader_synthetic_sentinel(self):
@@ -233,3 +233,51 @@ class TestPersistentWorkers:
         cfg = Config(data_path="synthetic", category="x", img_size=16,
                      num_workers=2, persistent_workers=False)
         assert make_dataloader(cfg).persistent_workers is False
+
+def test_epoch_sampler_covers_all_and_changes_order():
+    from diana.data.loader import EpochSampler
+    sampler = EpochSampler(17, 42)
+    first = list(sampler)
+    sampler.set_epoch(1)
+    second = list(sampler)
+    assert sorted(i for _, i in first) == list(range(17))
+    assert [i for _, i in first] != [i for _, i in second]
+    sampler.set_epoch(0)
+    assert list(sampler) == first
+
+
+def test_synthetic_epoch_is_independent_of_worker_rng():
+    from diana.data.loader import SyntheticDataset
+    cfg = Config(data_path="synthetic")
+    ds = SyntheticDataset(cfg)
+    first = ds[(3, 10)]
+    torch.manual_seed(989)
+    assert torch.equal(first, ds[(3, 10)])
+    assert not torch.equal(first, ds[(4, 10)])
+
+
+def test_graph_loader_rejects_empty_epoch(tmp_path):
+    root = TestMVTecDataset()._build_root(tmp_path)
+    cfg = Config(data_path=root, category="hazelnut", batch_size=4, use_cuda_graphs=True)
+    with pytest.raises(ValueError, match="full batch"):
+        make_dataloader(cfg)
+
+
+def test_short_download_without_hash_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr("diana.data.download.urllib.request.urlopen", lambda *a, **kw: _FakeResponse(b"x"))
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        fetch_one("repo", "hazelnut/a.png", str(tmp_path), 100, None)
+    assert not (tmp_path / "hazelnut/a.png").exists()
+    assert not (tmp_path / "hazelnut/a.png.part").exists()
+
+
+def test_persistent_workers_resume_same_epoch_data():
+    cfg = Config(data_path="synthetic", img_size=16, batch_size=64, num_workers=2)
+    continuous = make_dataloader(cfg)
+    list(continuous)  # advance persistent workers through an earlier epoch
+    continuous.sampler.set_epoch(3)
+    expected = torch.cat(list(continuous))
+    resumed = make_dataloader(cfg)
+    resumed.sampler.set_epoch(3)
+    actual = torch.cat(list(resumed))
+    assert torch.equal(actual, expected)
