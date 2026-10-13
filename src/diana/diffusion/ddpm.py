@@ -64,6 +64,22 @@ class DDPM(nn.Module):
     # Reverse process (inference only)
     # ------------------------------------------------------------------
 
+    def _respaced_step(self, t: int, t_prev: int | None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Effective (alpha, beta) for ONE reverse hop from index ``t`` to ``t_prev``.
+
+        Raw per-index alphas/betas are only valid for a unit step. When the
+        sampler strides (e.g. 250 of 1000), a hop from t to t_prev removes the
+        noise of every skipped step, so the hop's alpha is the product of the
+        skipped alphas -- which telescopes to abar[t] / abar[t_prev]. For
+        t_prev == t - 1 this is exactly alphas[t] (full chain is unchanged).
+        ``t_prev=None`` is the final hop to the clean image (abar_prev = 1).
+        """
+        abar = self.schedule.alphas_cumprod
+        abar_t = abar[t]
+        abar_prev = abar[t_prev] if t_prev is not None else torch.ones_like(abar_t)
+        alpha = abar_t / abar_prev
+        return alpha, (1.0 - alpha).clamp(min=0.0)
+
     @torch.no_grad()
     def _reverse(
         self,
@@ -72,28 +88,30 @@ class DDPM(nn.Module):
         clamp_x: bool = False,
     ) -> torch.Tensor:
         """Run the ancestral sampler along `times` (descending buffer indices).
-        Update rule (Ho et al., 2020, Alg. 2):
-          x_{t-1} = 1/sqrt(a_t) * (x_t - beta_t/sqrt(1-abar_t) * eps) + sqrt(beta_t)*z
-        Striding `times` (e.g. 250 of 1000 steps) treats each stride as one
-        reverse step: linear speedup, mild quality loss."""
+        Update rule (Ho et al., 2020, Alg. 2), with the schedule respaced to
+        the strided chain (see :meth:`_respaced_step`):
+          x_prev = 1/sqrt(a) * (x_t - b/sqrt(1-abar_t) * eps) + sqrt(b)*z
+        where (a, b) are the effective alpha/beta of the hop t -> next time.
+        The network is labeled with ``t`` -- the noise level ``x`` really is at."""
         n = x.shape[0]
-        for i, t_idx in enumerate(times.tolist()):
+        steps = times.tolist()
+        for i, t_idx in enumerate(steps):
             t_batch = torch.full((n,), t_idx, dtype=torch.long, device=x.device)
             eps_pred = self.unet(x, t_batch)
 
+            last = i == len(steps) - 1
+            alpha, beta = self._respaced_step(t_idx, None if last else steps[i + 1])
             abar_t = self.schedule.alphas_cumprod[t_idx]
-            beta_t = self.schedule.betas[t_idx]
-            alpha_t = self.schedule.alphas[t_idx]
 
-            mean = (x - beta_t / torch.sqrt(1.0 - abar_t) * eps_pred) / torch.sqrt(alpha_t)
+            mean = (x - beta / torch.sqrt(1.0 - abar_t) * eps_pred) / torch.sqrt(alpha)
             if clamp_x:
                 # Keeps intermediate samples in valid pixel range during
                 # visualization runs; harmless statistically, helps stability
                 # when starting from heavily noised real images.
                 mean = mean.clamp(-1.0, 1.0)
-            if i < len(times) - 1:
+            if not last:
                 noise = torch.randn_like(x)
-                x = mean + torch.sqrt(beta_t) * noise
+                x = mean + torch.sqrt(beta) * noise
             else:
                 x = mean  # no injected noise at the final step
         return x
@@ -143,10 +161,15 @@ class DDPM(nn.Module):
         t_start = self.schedule.num_timesteps - 1 if t_start is None else t_start
         if not 0 <= t_start < self.schedule.num_timesteps:
             raise ValueError(f"t_start must be in [0, {self.schedule.num_timesteps}), got {t_start}")
+        # x is noised to EXACTLY t_start, so the first denoising call must be
+        # labeled t_start too; the strided grid only supplies the steps below.
+        # (Labeling with the nearest grid point <= t_start would hand the
+        # network a sample noisier than the level it was told to expect.)
         times_all = self._stride_times(num_steps)
-        times = times_all[times_all <= t_start]
-        if len(times) == 0:
-            raise ValueError(f"no sampling steps at or below t_start={t_start}")
+        times = torch.cat([
+            torch.tensor([t_start], dtype=times_all.dtype, device=times_all.device),
+            times_all[times_all < t_start],
+        ])
 
         noise = torch.randn_like(x0)
         x = self.q_sample(x0, torch.full((x0.shape[0],), t_start, dtype=torch.long, device=x0.device), noise)

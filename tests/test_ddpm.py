@@ -1,3 +1,5 @@
+import itertools
+
 import pytest
 import torch
 
@@ -77,6 +79,62 @@ def test_reconstruct_partial_chain_preserves_structure(ddpm):
     dist_low = (rec_low - x0).pow(2).mean().item()
     dist_gen = (ddpm.sample(1, 32, num_steps=10) - x0).pow(2).mean().item()
     assert dist_low < dist_gen
+
+
+def test_respaced_alpha_is_product_of_skipped_alphas(ddpm):
+    """A strided hop must remove the noise of EVERY skipped step."""
+    alphas = ddpm.schedule.alphas
+    alpha, beta = ddpm._respaced_step(40, 30)
+    expected = alphas[31:41].prod()  # steps 40 .. 31 are crossed going 40 -> 30
+    assert torch.allclose(alpha, expected, rtol=1e-4)
+    assert torch.allclose(beta, 1.0 - expected, atol=1e-5)
+
+
+def test_respaced_unit_hop_matches_raw_schedule(ddpm):
+    for t in (1, 17, 99):
+        alpha, beta = ddpm._respaced_step(t, t - 1)
+        assert torch.allclose(alpha, ddpm.schedule.alphas[t], rtol=1e-4)
+        assert torch.allclose(beta, ddpm.schedule.betas[t], atol=1e-5)
+
+
+def test_respaced_final_hop_reaches_clean_image(ddpm):
+    alpha, _ = ddpm._respaced_step(0, None)
+    assert torch.allclose(alpha, ddpm.schedule.alphas[0], rtol=1e-4)
+
+
+def test_full_chain_matches_per_index_sampler(ddpm):
+    """Stride 1 must reproduce the original (unit-step) ancestral sampler."""
+
+    def legacy(x: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
+        s = ddpm.schedule
+        for i, t in enumerate(times.tolist()):
+            eps = ddpm.unet(x, torch.full((x.shape[0],), t, dtype=torch.long))
+            mean = (x - s.betas[t] / torch.sqrt(1.0 - s.alphas_cumprod[t]) * eps) / torch.sqrt(s.alphas[t])
+            x = mean + torch.sqrt(s.betas[t]) * torch.randn_like(x) if i < len(times) - 1 else mean
+        return x
+
+    times = ddpm._stride_times(None)  # every index: stride 1
+    x = torch.randn(2, 3, 32, 32)
+    with torch.no_grad():
+        torch.manual_seed(7)
+        new = ddpm._reverse(x.clone(), times)
+        torch.manual_seed(7)
+        old = legacy(x.clone(), times)
+    assert torch.allclose(new, old, rtol=1e-3, atol=1e-3)
+
+
+def test_reconstruct_first_label_is_t_start(ddpm):
+    """t_start is off the stride grid (99, 94, ...); the first call must still
+    be labeled t_start, since x was noised to exactly that level."""
+    labels: list[int] = []
+    handle = ddpm.unet.register_forward_hook(lambda _m, args, _out: labels.append(int(args[1][0])))
+    try:
+        ddpm.reconstruct(torch.randn(1, 3, 32, 32), num_steps=20, t_start=32)
+    finally:
+        handle.remove()
+    assert labels[0] == 32
+    assert all(a > b for a, b in itertools.pairwise(labels)), "labels must descend"
+    assert labels[-1] == 0
 
 
 def test_objective_guard():

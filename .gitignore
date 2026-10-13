@@ -15,3 +15,5 @@ wheels/
 PROJECT_INSTRUCTIONS.md
 /data/
 /runs/
+
+.DS_STORE
