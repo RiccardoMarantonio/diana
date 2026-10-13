@@ -6,6 +6,7 @@ import torch
 
 from diana.config import Config
 from diana.data.download import (
+    download_category,
     fetch_one,
     needs_download,
     plan_category,
@@ -77,6 +78,85 @@ class TestDownloadHelpers:
         rel, state = fetch_one("repo-x", "hazelnut/readme.txt", str(tmp_path), 4, None)
         assert state == "ok"
         assert rel == "hazelnut/readme.txt"
+
+
+class _FakeResponse:
+    """Minimal urlopen() stand-in: a context manager with chunked read()."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+        self._pos = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n: int) -> bytes:
+        chunk = self._payload[self._pos : self._pos + n]
+        self._pos += n
+        return chunk
+
+
+class TestDownloadIntegrity:
+    GOOD = b"good-bytes"
+
+    def _serve(self, monkeypatch, payload: bytes, calls: list | None = None):
+        def fake_urlopen(url, timeout=None):
+            if calls is not None:
+                calls.append(url)
+            return _FakeResponse(payload)
+
+        monkeypatch.setattr("diana.data.download.urllib.request.urlopen", fake_urlopen)
+
+    def test_rejects_paths_that_escape_the_destination(self, tmp_path, monkeypatch):
+        self._serve(monkeypatch, self.GOOD)
+        dest = tmp_path / "data"
+        dest.mkdir()
+        for evil in ("../escaped.txt", "hazelnut/../../escaped.txt", "/tmp/escaped.txt"):
+            with pytest.raises(ValueError, match="outside"):
+                fetch_one("repo", evil, str(dest), None, None)
+        assert not (tmp_path / "escaped.txt").exists()
+
+    def test_mismatch_leaves_nothing_at_the_final_path(self, tmp_path, monkeypatch):
+        self._serve(monkeypatch, b"corrupted")
+        want = hashlib.sha256(self.GOOD).hexdigest()
+        with pytest.raises(RuntimeError, match="sha256 mismatch"):
+            fetch_one("repo", "hazelnut/a.png", str(tmp_path), None, want)
+        assert not (tmp_path / "hazelnut" / "a.png").exists()
+        assert not (tmp_path / "hazelnut" / "a.png.part").exists()
+
+    def test_size_matching_but_corrupt_file_is_refetched(self, tmp_path, monkeypatch):
+        calls: list = []
+        self._serve(monkeypatch, self.GOOD, calls)
+        target = tmp_path / "hazelnut" / "a.png"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"X" * len(self.GOOD))  # same size, wrong content
+        want = hashlib.sha256(self.GOOD).hexdigest()
+        fetch_one("repo", "hazelnut/a.png", str(tmp_path), len(self.GOOD), want)
+        assert target.read_bytes() == self.GOOD
+        assert len(calls) == 1
+
+    def test_intact_file_is_not_refetched(self, tmp_path, monkeypatch):
+        calls: list = []
+        self._serve(monkeypatch, self.GOOD, calls)
+        target = tmp_path / "hazelnut" / "a.png"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.GOOD)
+        want = hashlib.sha256(self.GOOD).hexdigest()
+        fetch_one("repo", "hazelnut/a.png", str(tmp_path), len(self.GOOD), want)
+        assert calls == []
+
+    def test_download_category_surfaces_a_failure(self, tmp_path, monkeypatch):
+        tree = [
+            {"type": "file", "path": f"hazelnut/{i}.png", "size": 3, "lfs": {"oid": "00" * 32}}
+            for i in range(6)
+        ]
+        monkeypatch.setattr("diana.data.download._fetch_json", lambda url: tree)
+        self._serve(monkeypatch, b"abc")  # hash never matches "00"*32
+        with pytest.raises(RuntimeError, match="sha256 mismatch"):
+            download_category("hazelnut", str(tmp_path), repo="r", verify=True, workers=2)
 
 
 class TestMVTecDataset:

@@ -1,6 +1,6 @@
 import pytest
 
-from diana.config import load_toml_config, parse_args
+from diana.config import Config, load_toml_config, parse_args
 
 
 def _write_toml(tmp_path, content: str) -> str:
@@ -29,6 +29,18 @@ class TestDefaults:
         )
         assert cfg.img_size == 128
         assert cfg.base_channels == 128
+
+
+class TestObjective:
+    def test_only_the_implemented_objective_is_accepted(self):
+        assert Config(data_path="x", objective="pred_noise").objective == "pred_noise"
+        for unimplemented in ("pred_x0", "pred_v"):
+            with pytest.raises(ValueError, match="objective"):
+                Config(data_path="x", objective=unimplemented)
+
+    def test_cli_rejects_unimplemented_objective(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--data_path", "x", "--objective", "pred_v"])
 
 
 class TestToml:

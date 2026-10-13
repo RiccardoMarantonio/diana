@@ -1,6 +1,5 @@
-from diana.config import parse_args
+"""DIANA: unsupervised anomaly detection with diffusion models.
 
-
-def main() -> None:
-    parse_args()
-    print("Config loaded...")
+Run the stages as modules: ``python -m diana.train``, ``diana.sample``,
+``diana.profiler``, ``diana.data.download``.
+"""

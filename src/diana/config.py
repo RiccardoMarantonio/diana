@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 VALID_SCHEDULES = {"linear", "cosine"}
-VALID_OBJECTIVES = {"pred_noise", "pred_x0", "pred_v"}
+VALID_OBJECTIVES = {"pred_noise"}  # the only objective DDPM implements
 VALID_DEVICES = {"cpu", "cuda", "mps", "auto"}
 
 
@@ -364,7 +364,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--objective",
         type=str,
         default=argparse.SUPPRESS,
-        choices=["pred_noise", "pred_x0", "pred_v"],
+        choices=sorted(VALID_OBJECTIVES),
         help="Diffusion objective",
     )
     diffusion_group.add_argument(

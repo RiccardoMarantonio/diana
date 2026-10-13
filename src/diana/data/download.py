@@ -20,7 +20,7 @@ import json
 import os
 import sys
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HF_API = "https://huggingface.co/api/datasets"
 HF_RESOLVE = "https://huggingface.co/datasets"
@@ -71,6 +71,19 @@ def sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def _safe_local_path(dest_root: str, rel_path: str) -> str:
+    """Join ``rel_path`` under ``dest_root``, refusing anything that escapes it.
+
+    ``rel_path`` comes from a remote listing (``--repo`` is user-controlled), so
+    ``..`` segments or absolute paths must not be able to write elsewhere.
+    """
+    root = os.path.realpath(dest_root)
+    local = os.path.realpath(os.path.join(root, rel_path))
+    if local == root or os.path.commonpath([root, local]) != root:
+        raise ValueError(f"refusing remote path outside the destination: {rel_path!r}")
+    return local
+
+
 def needs_download(local: str, expected_size: int | None) -> bool:
     """True unless a complete file of the expected size already exists."""
     if expected_size is None:
@@ -85,9 +98,15 @@ def fetch_one(
     expected_size: int | None,
     expected_sha256: str | None,
 ) -> tuple[str, str]:
-    """Download one file to ``dest_root/rel_path``, verifying hash and size."""
-    local = os.path.join(dest_root, rel_path)
-    if not needs_download(local, expected_size):
+    """Download one file to ``dest_root/rel_path``, verifying hash and size.
+
+    A file already on disk with the right size is re-hashed when a digest is
+    known, so a corrupt leftover from an earlier run is replaced, not trusted.
+    """
+    local = _safe_local_path(dest_root, rel_path)
+    if not needs_download(local, expected_size) and (
+        not expected_sha256 or sha256_file(local) == expected_sha256
+    ):
         return rel_path, "ok"
     os.makedirs(os.path.dirname(local), exist_ok=True)
     tmp = f"{local}.part"
@@ -98,12 +117,15 @@ def fetch_one(
             dst.write(chunk)
             if expected_sha256:
                 digest.update(chunk)
-    os.replace(tmp, local)
+    # Verify BEFORE the file takes its final name: a corrupt download must
+    # never be left where a later run (or the loader) would accept it.
     if expected_sha256 and digest.hexdigest() != expected_sha256:
+        os.remove(tmp)
         raise RuntimeError(
             f"sha256 mismatch for {rel_path}: got {digest.hexdigest()}, "
             f"expected {expected_sha256}"
         )
+    os.replace(tmp, local)
     return rel_path, "ok"
 
 
@@ -128,8 +150,15 @@ def download_category(
             pool.submit(fetch_one, repo, p["path"], dest, p["size"], p["sha256"]): p
             for p in plan
         }
-        for future in futures:
-            rel, state = future.result()
+        for future in as_completed(futures):
+            try:
+                rel, state = future.result()
+            except Exception:
+                # Surface the first failure now; don't let the remaining
+                # queued downloads run to completion before reporting it.
+                for pending in futures:
+                    pending.cancel()
+                raise
             done += 1
             if done % max(1, len(plan) // 10) == 0 or done == len(plan):
                 print(f"  [{done}/{len(plan)}] {state} {rel}")

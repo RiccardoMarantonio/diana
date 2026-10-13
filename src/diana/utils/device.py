@@ -68,7 +68,9 @@ def worker_init_fn(worker_id: int) -> None:
 
     ``torch.initial_seed()`` inside a worker already derives a unique seed per
     worker from the global base seed, so back-to-back runs are reproducible
-    while workers still draw non-identical streams.
+    while workers still draw non-identical streams. The extra ``+ worker_id``
+    is redundant; it is kept only because dropping it would change the Python
+    RNG streams (and thus augmentation draws) of every existing run.
     """
     seed = (torch.initial_seed() + worker_id) % (2**32)
     random.seed(seed)

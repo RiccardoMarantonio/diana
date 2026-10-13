@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import torch
 from torch import nn
@@ -6,8 +7,18 @@ from torch import nn
 
 def _group_norm(channels: int) -> nn.GroupNorm:
     """GroupNorm with up to 32 groups; group count must divide channel count,
-    so fall back via gcd for odd widths (keeps the block width-agnostic)."""
-    return nn.GroupNorm(math.gcd(32, channels), channels)
+    so fall back via gcd for odd widths (keeps the block width-agnostic).
+
+    Few groups degrade toward LayerNorm/InstanceNorm behavior, so a width that
+    forces that fallback is flagged instead of silently accepted."""
+    groups = math.gcd(32, channels)
+    if groups < 8:
+        warnings.warn(
+            f"GroupNorm over {channels} channels falls back to {groups} group(s); "
+            "use channel widths divisible by 8 (ideally 32) for normal GroupNorm behavior",
+            stacklevel=2,
+        )
+    return nn.GroupNorm(groups, channels)
 
 
 class SinusoidalEmbedding(nn.Module):
