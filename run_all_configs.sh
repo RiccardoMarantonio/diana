@@ -5,7 +5,12 @@ set -euo pipefail
 # Usage: ./run_all_configs.sh [epochs] [max_test_images]
 EPOCHS="${1:-100}"
 LIMIT="${2:-200}"
+DEVICE="${DEVICE:-auto}"
+CUDA_GRAPHS="${CUDA_GRAPHS:-0}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "Device: $DEVICE | training CUDA graphs: $CUDA_GRAPHS"
+echo "Set DEVICE=cuda to require a CUDA GPU; set CUDA_GRAPHS=1 to enable graphs during training."
 
 shopt -s nullglob
 CONFIGS=("$SCRIPT_DIR"/configs/*.toml)
