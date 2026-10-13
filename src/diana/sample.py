@@ -32,6 +32,7 @@ from diana.diffusion.ddpm import DDPM
 from diana.models.ema import EMA
 from diana.train import build_ddpm
 from diana.utils.device import resolve_device, set_seed
+from diana.utils.inference_graph import InferenceGraph
 
 
 def load_checkpoint_run(run_dir: str, tag: str = "best") -> tuple[Config, DDPM, EMA]:
@@ -137,6 +138,8 @@ def run_inference(
     pixel: bool = False,
     use_ema: bool = True,
     seed: int | None = None,
+    report_path: str | None = None,
+    use_cuda_graphs: bool = False,
 ) -> dict:
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive")
@@ -149,6 +152,7 @@ def run_inference(
     # checkpoint + t_start yields identical scores (defaults to the training
     # seed). Without this, repeated evals of one model differ by ~±0.03-0.05
     # AUROC -- pure sampling noise that swamps t_start comparisons.
+    denoiser = InferenceGraph(model.unet, enabled=use_cuda_graphs)
     set_seed(cfg.seed if seed is None else seed)
     try:
         ds = MVTecEvalDataset(cfg.data_path, cfg.category, img_size=cfg.img_size)
@@ -166,7 +170,7 @@ def run_inference(
             labels = torch.tensor([r[1] for r in rows])
             masks = torch.stack([r[2] for r in rows])
 
-            recon = model.reconstruct(x, num_steps=num_steps, t_start=t_start)
+            recon = model.reconstruct(x, num_steps=num_steps, t_start=t_start, denoiser=denoiser)
             amap = (x - recon).pow(2).mean(dim=1)
             scores = amap.mean(dim=(1, 2))
 
@@ -201,6 +205,7 @@ def run_inference(
         report = {
             "category": cfg.category, "tag": tag, "t_start": t_start, "num_steps": num_steps,
             "device": device.type, "n": len(scores),
+            "use_cuda_graphs": denoiser.graph is not None,
             "ema_applied": use_ema, "seed": cfg.seed if seed is None else seed,
             "image_auroc": round(image_auc, 6),
             "pixel_auroc": round(pixel_auc, 6) if pixel_auc is not None else None,
@@ -208,7 +213,8 @@ def run_inference(
             "good_mean": round(good, 6), "defect_mean": round(bad, 6),
             "grid": os.path.relpath(out),
         }
-        eval_json = os.path.join(run_dir, "eval.json")
+        eval_json = report_path or os.path.join(run_dir, "eval.json")
+        os.makedirs(os.path.dirname(os.path.abspath(eval_json)), exist_ok=True)
         with open(eval_json, "w") as f:
             json.dump(report, f, indent=2, sort_keys=True)
 
@@ -233,6 +239,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="SDEdit noising level; higher = stronger healing (default: checkpointed eval_t_start)")
     parser.add_argument("--num_steps", type=int, default=None, help="Sampling strides (default: checkpointed config)")
     parser.add_argument("--out", default=None, help="Output grid PNG path")
+    parser.add_argument("--use_cuda_graphs", action="store_true", help="Capture denoiser forward on CUDA")
+    parser.add_argument("--report", default=None, help="JSON report path (default: run/eval.json)")
     parser.add_argument("--limit", type=int, default=64, help="Max test images to score")
     parser.add_argument("--pixel", action="store_true",
                         help="Also score pixel-level AUROC against ground-truth masks (all selected images)")
@@ -247,7 +255,8 @@ def main(argv: list[str] | None = None) -> None:
     num_steps = cfg.sample_timesteps if args.num_steps is None else args.num_steps
     t_start = args.t_start if args.t_start is not None else cfg.eval_t_start_effective
     run_inference(args.run, args.tag, t_start, num_steps, args.out, args.limit,
-                  pixel=args.pixel, use_ema=not args.no_ema, seed=args.seed)
+                  pixel=args.pixel, use_ema=not args.no_ema, seed=args.seed, report_path=args.report,
+                  use_cuda_graphs=args.use_cuda_graphs)
 
 
 if __name__ == "__main__":

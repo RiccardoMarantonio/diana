@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -263,3 +264,14 @@ def test_pixel_metric_includes_normal_images(tmp_path, monkeypatch):
     monkeypatch.setattr(sample, "auc_sorted", capture)
     run_inference(run_dir, "best", 8, 8, None, limit=4, pixel=True)
     assert observed == [4 * 16 * 16]
+
+
+def test_exploratory_report_preserves_canonical_result(tmp_path):
+    run_dir = TestSeededSampling()._ckpt(tmp_path)
+    canonical = os.path.join(run_dir, "eval.json")
+    with open(canonical, "w") as f:
+        f.write('"keep canonical"')
+    destination = str(tmp_path / "exploratory" / "t8.json")
+    run_inference(run_dir, "best", 8, 8, None, limit=4, report_path=destination)
+    assert json.loads(Path(canonical).read_text()) == "keep canonical"
+    assert json.loads(Path(destination).read_text())["t_start"] == 8

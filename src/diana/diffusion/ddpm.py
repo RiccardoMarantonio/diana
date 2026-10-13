@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -43,8 +45,7 @@ class DDPM(nn.Module):
 
         The stochastic pieces (t draw, noise draw) are injected by the caller
         so the deterministic core can run inside a CUDA-graph capture while
-        the random numbers stay fresh per step (a captured ``randn`` would
-        freeze training). ``loss()`` below is just this with the draws.
+        callers independently control the noise and timestep streams. ``loss()`` below is just this with the draws.
         """
         x_t = self.q_sample(x0, t, noise)
         eps_pred = self.unet(x_t, t)
@@ -86,6 +87,7 @@ class DDPM(nn.Module):
         x: torch.Tensor,
         times: torch.Tensor,
         clamp_x: bool = False,
+        denoiser: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Run the ancestral sampler along `times` (descending buffer indices).
         Update rule (Ho et al., 2020, Alg. 2), with the schedule respaced to
@@ -97,7 +99,7 @@ class DDPM(nn.Module):
         steps = times.tolist()
         for i, t_idx in enumerate(steps):
             t_batch = torch.full((n,), t_idx, dtype=torch.long, device=x.device)
-            eps_pred = self.unet(x, t_batch)
+            eps_pred = (self.unet if denoiser is None else denoiser)(x, t_batch)
 
             last = i == len(steps) - 1
             alpha, beta = self._respaced_step(t_idx, None if last else steps[i + 1])
@@ -145,6 +147,7 @@ class DDPM(nn.Module):
         x0: torch.Tensor,
         num_steps: int | None = None,
         t_start: int | None = None,
+        denoiser: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """SDEdit-style reconstruction -- the anomaly-detection workhorse.
 
@@ -173,4 +176,4 @@ class DDPM(nn.Module):
 
         noise = torch.randn_like(x0)
         x = self.q_sample(x0, torch.full((x0.shape[0],), t_start, dtype=torch.long, device=x0.device), noise)
-        return self._reverse(x, times)
+        return self._reverse(x, times, denoiser=denoiser)
