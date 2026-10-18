@@ -1,151 +1,291 @@
-# diana
+# DIANA — (Diffusion-based Industrial Anomaly Analysis)
 
-Unsupervised **diffusion-based anomaly detection** on [MVTec AD](https://www.mvtec.com/company/research/datasets/mvtec-ad)
-(hazelnut, 64x64): train a DDPM on defect-free images only; at test time an
-image is noised to an intermediate level (`t_start`) and re-imagined by the
-model. The working hypothesis is that reconstruction suppresses unseen defects;
-the squared reconstruction residual is the anomaly score.
+DIANA is a PyTorch project for detecting defects in industrial images from
+[MVTec AD](https://www.mvtec.com/research-teaching/datasets/mvtec-ad). A
+Denoising Diffusion Probabilistic Model (DDPM) is trained on defect-free images
+only. At test time, noise is added to an image and the model reconstructs it.
+The squared difference between the input and the reconstruction provides:
 
-Small, fully typed, CLI-only PyTorch codebase (no `train.py --argparse` soup,
-no config blobs): every setting lives in `src/diana/config.py` and can be
-supplied as a TOML file, a CLI flag, or both (CLI > TOML > defaults). HPC
-features from the spec: AMP, `cudnn.benchmark`, CUDA graphs, `torch.profiler`
-harness, tuned dataloaders. Dev/iterate on Apple Silicon (MPS), run the real
-training on a Colab T4.
+- an **anomaly map**, with one score per pixel;
+- an **image score**, obtained by averaging the anomaly map.
 
-## Layout
+The working hypothesis is that reconstruction changes defects more than healthy
+regions. It can also preserve a defect or alter a healthy region, so performance
+is evaluated separately at image and pixel level using AUROC.
 
+The experiments in the [project report](relazione.md) cover **bottle, cable,
+capsule, carpet and leather**, with a separate model for each category. The
+[report materials](relazione_materiali/README.md) contain the evaluation and
+profiling reports used in the comparison. The [PDF version](relazione.pdf) is
+the submission copy; `relazione.md` remains the editable source. The PDF uses
+absolute GitHub links to code and supporting materials.
+
+## Requirements and installation
+
+Use **Python 3.12 or later** and [uv](https://docs.astral.sh/uv/). The dependency
+versions are declared in `pyproject.toml`; `uv.lock` records the resolved versions.
+CUDA is supported for NVIDIA GPUs, MPS for Apple Silicon, and CPU for development
+and small checks. Full training is substantially more demanding than a smoke run.
+
+```bash
+git clone https://github.com/RiccardoMarantonio/diana.git
+cd diana
+uv sync
 ```
-src/diana/
-  config.py            single Config dataclass + TOML/CLI merge
-  diffusion/           DDPM (q_sample, eps-loss, strided sampler, SDEdit)
-  models/              UNet, EMA shadow weights
-  data/                MVTec downloader (HF mirror, sha256-verified),
-                       dataset (+eval masks), dataloader factory
-  train.py             training loop, RNG-aware resume, checkpoint cadence
-  sample.py            inference: anomaly maps, image+pixel AUROC, grids
-  profiler.py          HPC benchmark harness (train/inference/sweep)
-  utils/               device, AMP ordering, CUDA graphs
-configs/hazelnut.toml  canonical single-category config
-tests/                 unit, integration, and accelerator regression tests
-```
+
+Alternatively, install the package with `pip install -e .`. The commands below
+use `uv run` to select the project environment.
 
 ## Quick start
 
-```bash
-uv sync                                   # or: pip install -e .
-uv run pytest tests/ -q                   # accelerator tests skip when unavailable
-uvx ruff check src tests && uvx ty check src
+Run a short training check on synthetic images without downloading MVTec AD:
 
-# smoke run on random tensors (MPS on Apple Silicon)
-uv run python -m diana.train --config configs/hazelnut.toml \
+```bash
+uv run python -m diana.train --config configs/bottle.toml \
     --data_path synthetic --epochs 2
-
-# real data
-uv run python -m diana.data.download --categories hazelnut
-uv run python -m diana.train --config configs/hazelnut.toml \
-    --epochs 1 --batch_size 8 --num_workers 2
-
-# resume from the latest run dir (restores weights, AMP scaler, EMA, RNG)
-uv run python -m diana.train --config configs/hazelnut.toml \
-    --resume_from runs/hazelnut-<timestamp>
-
-# infer + score against the checkpoint
-uv run python -m diana.sample --run runs/hazelnut-<timestamp> --pixel
 ```
 
-## One-shot run (Colab T4 or local)
-
-`t4.sh` is device-agnostic (`device = "auto"` picks CUDA on Colab, MPS on
-Apple Silicon). It benchmarks and trains the selected category, evaluates
-image- and pixel-level AUROC across `t_start`, then writes a CSV and SVG chart.
-Pass `all` as the config to run every category config in `configs/`:
+To train and evaluate on real images:
 
 ```bash
-git clone https://github.com/RiccardoMarantonio/diana.git && cd diana
-bash t4.sh              # 100 total epochs, at most 200 unique test images
-bash t4.sh 3 32         # local smoke: 3 epochs, 32-sample eval
+uv run python -m diana.data.download --categories bottle
+uv run python -m diana.train --config configs/bottle.toml
+```
+
+Training prints the directory created under `runs/`. Substitute that directory
+for `runs/bottle-<timestamp>` in subsequent commands:
+
+```bash
+uv run python -m diana.sample --run 'runs/bottle-<timestamp>' --pixel
+```
+
+`--pixel` enables pixel AUROC against the defect masks; image AUROC is always
+computed. Evaluation uses `best.pt`, EMA weights, and the checkpoint's configured
+seed, `eval_t_start` and `sample_timesteps` unless explicitly overridden.
+
+## Complete workflow
+
+`t4.sh` downloads or verifies the data, profiles synthetic training, trains the
+model, evaluates it at the configured noise level, runs an exploratory noise-level
+sweep, profiles inference, and generates a CSV table and SVG chart.
+
+Its arguments are the **total number of epochs**, the **maximum number of test
+images**, and the **configuration file**. Pass the configuration explicitly to
+select the category:
+
+```bash
 bash t4.sh 100 200 configs/bottle.toml
-bash t4.sh 100 200 all  # train/evaluate all configs, one after another
-./run_all_configs.sh 100 200  # explicit runner over configs/*.toml
+bash t4.sh 3 32 configs/bottle.toml  # short workflow check
 ```
 
-`run_all_configs.sh` takes the same epoch and image-limit arguments as `t4.sh`
-and runs the full workflow once per TOML config. It stops if any category
-fails. `FRESH=1` and `T_STARTS` are forwarded to each run.
-
-`data/` is gitignored, so the script re-downloads it on a fresh machine. If a
-session dies mid-training, rerunning resumes the latest category checkpoint.
-Set `FRESH=1` to start a new model instead. The script verifies existing data
-and repairs incomplete downloads on every run. It does not update the Git checkout.
-The config snapshot lives in the run directory:
+To run exactly the five categories used in the report:
 
 ```bash
-bash t4.sh 100 200      # or, manually:
-uv run python -m diana.train --resume_from runs/hazelnut-<ts> --epochs 100
+for category in bottle cable capsule carpet leather; do
+    bash t4.sh 100 200 "configs/$category.toml" || break
+done
 ```
 
-Manual equivalents (defaults shown):
+To process every TOML configuration present in `configs/`, use either command:
 
 ```bash
-uv run python -m diana.data.download --categories hazelnut
-uv run python -m diana.profiler sweep --config configs/hazelnut.toml --steps 50
-uv run python -m diana.train --config configs/hazelnut.toml \
-    --use_amp --cudnn_benchmark --epochs 100
-uv run python -m diana.sample --run runs/hazelnut-<ts> --pixel --limit 200
+bash t4.sh 100 200 all
+bash run_all_configs.sh 100 200
 ```
 
-Each run stores its canonical result in `eval.json` and `evaluations/final.json`,
-using the checkpoint's configured `eval_t_start`. The CSV and SVG under
-`evaluations/` contain **exploratory** per-`t_start` reports. The script never
-promotes the highest test AUROC into the canonical result.
-Set `T_STARTS="50 100 150 200"` to change the exploratory sweep.
+Both stop on the first failed category. These commands follow the contents of
+`configs/`, which may include categories outside the report.
+
+### Device and execution options
+
+| Environment variable | Default | Effect |
+|---|---|---|
+| `DEVICE` | `auto` | Select `auto`, `cuda`, `mps` or `cpu` |
+| `FRESH` | `0` | Set to `1` to start a new training run instead of resuming |
+| `T_STARTS` | `100 150 200` | Noise levels for the exploratory evaluation sweep |
+| `CUDA_GRAPHS` | `0` | Set to `1` to request CUDA graphs during training |
+
+With `auto`, device selection prefers CUDA, then MPS, then CPU. An explicit
+`DEVICE=cuda` request fails before downloading data if CUDA is unavailable.
+For example, after selecting a GPU runtime in Colab:
+
+```bash
+DEVICE=cuda bash t4.sh 100 200 configs/bottle.toml
+DEVICE=cuda CUDA_GRAPHS=1 bash t4.sh 100 200 configs/bottle.toml
+FRESH=1 T_STARTS="50 100 150 200" bash t4.sh 100 200 configs/bottle.toml
+```
+
+The script requests AMP and cuDNN benchmarking for training. AMP uses FP16 only
+on CUDA; CPU and MPS use the regular execution path. When `DEVICE=cuda` is
+explicitly set, the workflow also benchmarks inference with CUDA graphs in
+addition to eager inference. With `DEVICE=auto`, it only runs the eager inference
+benchmark, even if CUDA is selected automatically.
+
+`data/` is ignored by Git. The downloader verifies existing files and repairs
+incomplete downloads. The scripts operate on the current checkout and do not
+pull updates from GitHub.
+
+## Configuration and training recovery
+
+Settings are defined in [src/diana/config.py](src/diana/config.py). TOML keys
+match the configuration fields. For a new run, precedence is **CLI > TOML >
+defaults**; when resuming, it is **CLI > TOML > checkpoint > defaults**.
+
+The five category configurations share these main settings:
+
+| Setting | Value |
+|---|---|
+| Input | RGB, 64 × 64 pixels after preprocessing |
+| U-Net | Base width 64; channel multipliers 1, 2, 4, 8 |
+| Residual blocks | 2 per encoder level, 3 per decoder level |
+| Attention | 16 × 16 resolution, 4 heads |
+| Diffusion | 1000 timesteps; linear beta schedule from 0.0001 to 0.02 |
+| Training | 100 epochs; batch size 16; AdamW |
+| Learning rate | 0.0001; linear warm-up over 1000 optimizer steps |
+| Weight decay / gradient clipping | 0.000001 / maximum gradient norm 1.0 |
+| Dropout / EMA decay | 0.1 / 0.9999 |
+| Evaluation | `eval_t_start=150`; `sample_timesteps=250`; seed 42 |
+
+A training run saves `config.json` and model checkpoints:
+
+- **`best.pt`** stores the epoch with the lowest mean training loss. It is the
+  default for evaluation; it is not selected by test AUROC.
+- **`last.pt`** is saved every 25 epochs and at the end, for recovery.
+
+Checkpoints include model and optimizer state, AMP scaler, EMA weights,
+training counters, and available CPU/CUDA/MPS random-generator states. Writes
+are atomic. Resume accepts a run directory or checkpoint path and rejects
+incompatible changes to the category, model or diffusion schedule:
+
+```bash
+uv run python -m diana.train \
+    --resume_from 'runs/bottle-<timestamp>' --epochs 100
+```
+
+`--epochs 100` means 100 total epochs, including those already completed.
+The workflow script automatically finds the latest `last.pt` for the category
+unless `FRESH=1` is set. Manual resume without a TOML file retains the saved
+configuration apart from explicit CLI overrides.
 
 ## Evaluation protocol
 
-- Fix `eval_t_start` before final testing, or choose it on a separate validation
+Images are converted to RGB, resized to 128 × 128 pixels, center-cropped to
+64 × 64, and normalized to [-1, 1]. Training additionally uses random horizontal
+flips with probability 0.5. Masks receive the same geometric transformation,
+with nearest-neighbor interpolation and binary output. Training uses only
+`train/good`; test labels and masks are used only for evaluation.
+
+The anomaly map is the squared reconstruction error averaged over the three
+RGB channels. The image score is its spatial mean. **Image AUROC** compares
+image scores with healthy/defective labels; **pixel AUROC** compares map values
+with masks across all selected images, including healthy images. An AUROC of
+0.5 corresponds to random ordering and 1.0 to perfect ordering. Neither metric
+specifies an operating threshold or its false-alarm rate.
+
+For reproducible comparisons:
+
+- Choose `eval_t_start` before final testing, preferably on a separate validation
   split. Existing configurations were explored on test data in earlier runs;
-  retaining them does not retrospectively make those results unbiased.
-- Evaluation disables dropout and uses EMA weights by default. `--limit` caps
-  the number of unique images; it never repeats images to fill the limit.
-- Pixel AUROC now includes **all selected test images**, including normal images.
-  Reports record `pixel_scope`. Older reports used defective images only and
-  must not be compared directly without recomputing them.
-- The seed controls reconstruction noise. Report variability across independent
-  seeds and preserve the checkpoint, configuration, code revision and sample count.
-- Center cropping can remove defects; inspect transformed masks for each category.
-- `sample_timesteps` specifies the grid across the full diffusion chain. The
-  reconstruction uses only grid points below `t_start`, plus `t_start` itself;
-  250 grid points at `t_start=150` means 39 denoiser calls, not 250.
+  keeping their values does not make those results an independent evaluation.
+  This limitation also applies to the configured results in the project report;
+  the exploratory sweep is presented separately and does not select the final
+  result by its highest test AUROC.
+- Preserve the checkpoint, configuration, code revision, sample count, device,
+  EMA setting and seed. Report variability across independent seeds. Evaluation
+  disables dropout; the seed controls reconstruction noise. Device kernels may
+  still be nondeterministic, especially with cuDNN benchmarking enabled.
+- Inspect transformed masks. Center cropping can remove a defect while the
+  image retains its original defective label.
+- Compare matching pixel scopes. Older reports used defective images only;
+  current reports record `pixel_scope="all_test_images"`.
 
-## Training, recovery and profiling
+`--limit` caps the number of unique test images without repeating samples.
+All five reported categories have fewer than 200 test images, so the complete
+workflow evaluates their full test sets with the default limit.
 
-- Training shuffles samples by epoch. Eager training includes the final small
-  batch and correctly normalizes incomplete accumulation groups. Fixed-shape
-  CUDA graph training drops the shuffled tail and rejects an empty epoch.
-- Augmentation and synthetic data depend on seed, epoch and sample index,
-  allowing worker restarts without losing data reproducibility. This changes
-  trajectories relative to older versions. Device kernels may still be
-  nondeterministic, particularly with cuDNN benchmarking enabled.
-- Checkpoints are published atomically and include CPU, CUDA and MPS RNG state
-  when available. On resume, precedence is CLI > TOML > checkpoint > defaults;
-  incompatible model/schedule changes are rejected. Legacy checkpoints without
-  MPS state cannot reproduce the original MPS stream exactly.
-- `--use_cuda_graphs` captures training forward/backward. The same option on
-  `diana.sample` or `diana.profiler inference` captures the denoiser forward at
-  each reverse step. Noise remains outside inference capture. CPU/MPS use eager
-  execution. Capture failure falls back to eager execution when recoverable;
-  replay failures propagate. PyTorch graph-safe dropout RNG advances on replay;
-  use zero dropout for fixed-input training parity comparisons.
-- Profiling `--steps` counts measured optimizer updates for training and batches
-  for inference. Training excludes two warmup updates; inference excludes one
-  warmup reconstruction. CUDA and MPS are synchronized at timing boundaries.
-  Reports include images/s and effective graph/backend settings. CUDA memory is
-  the interval peak allocation, MPS memory is the current allocation, and CPU RSS
-  is the process-lifetime peak; `memory_scope` identifies the measurement.
-- On the default linear schedule, alpha-bar is approximately 0.895 at t=100
-  and 0.0778 at t=500. Increasing `t_start` removes more input structure; select
-  its value through the evaluation protocol above.
+`sample_timesteps` defines a grid across the full 1000-step diffusion chain.
+Reconstruction starts at `t_start` and uses only the grid points below it.
+With 250 grid points and `t_start=150`, this requires **39 denoiser calls**.
+Increasing `t_start` allows larger changes but can also distort healthy regions.
 
-GPU execution and final anomaly-detection performance require a real accelerator
-run. Passing CPU tests alone is not evidence of CUDA speedups or model accuracy.
+## Output files
+
+The complete workflow produces:
+
+| Location | Contents |
+|---|---|
+| `runs/<category>-<timestamp>/config.json` | Configuration snapshot |
+| `runs/<category>-<timestamp>/best.pt`, `last.pt` | Training checkpoints |
+| `runs/<category>-<timestamp>/eval.json` | Evaluation at the configured `eval_t_start` |
+| `runs/<category>-<timestamp>/evaluations/final.json` | Copy of that evaluation |
+| `runs/<category>-<timestamp>/evaluations/eval_t*.json` | Exploratory sweep reports |
+| `runs/<category>-<timestamp>/evaluations/evaluation.csv`, `evaluation.svg` | Sweep table and chart |
+| `runs/<category>-<timestamp>/anomaly_best_t*.png` | Input, reconstruction and heatmap grids |
+| `runs/<category>-<timestamp>/profiling/inference_eager.json` | Eager inference benchmark |
+| `runs/<category>-<timestamp>/profiling/inference_cuda_graphs.json` | Inference graph benchmark when explicitly running with `DEVICE=cuda` |
+| `runs/<category>-prof-<timestamp>.json` | Synthetic training sweep |
+
+The sweep does not replace `eval.json` or `evaluations/final.json` with the
+highest test AUROC. Heatmap colors are normalized separately per image, so
+colors cannot be used to compare absolute anomaly scores across images.
+
+## Profiling and CUDA graphs
+
+Run profiling independently with:
+
+```bash
+uv run python -m diana.profiler sweep --config configs/bottle.toml --steps 50
+uv run python -m diana.profiler inference --config configs/bottle.toml \
+    --run 'runs/bottle-<timestamp>' --steps 5 --out runs/bottle-inference.json
+```
+
+The training sweep compares FP32/AMP with cuDNN benchmarking off/on on CUDA;
+it measures one regular variant on CPU or MPS. It uses synthetic data and
+excludes two warm-up optimizer updates. `--steps` counts measured optimizer
+updates for training and batches for inference. Inference excludes one warm-up
+reconstruction. Neither measurement is the total training time on MVTec AD.
+
+Reports include throughput and memory scope. CUDA memory is the peak allocation
+in the measured interval; MPS memory is the current allocation; CPU RSS is the
+process-lifetime peak. CUDA and MPS are synchronized at timing boundaries.
+The individual `train` profiling command also supports operator tables from
+`torch.profiler`; use `--no_profiler` to disable them. Inference benchmarks use
+synthetic input tensors, optionally with trained checkpoint weights, and do not
+measure dataset loading or AUROC.
+
+`--use_cuda_graphs` captures training forward/backward or the denoiser forward
+in inference. Inference noise generation stays outside capture. CPU and MPS
+use eager execution. Recoverable capture failures fall back to eager; replay
+failures propagate. Fixed-shape graph training drops the final incomplete
+batch, while eager training includes it. Use zero dropout for fixed-input
+training parity checks because dropout randomness advances during graph replay.
+
+## Project layout and development checks
+
+```text
+src/diana/
+  config.py       Configuration, TOML and CLI parsing
+  data/           Download verification, datasets, transforms and data loaders
+  diffusion/      Noise schedules, DDPM loss and reconstruction
+  models/         U-Net and EMA weights
+  train.py        Training, checkpoint saving and recovery
+  sample.py       Anomaly maps, image/pixel AUROC and image grids
+  plot_eval.py    CSV tables and SVG charts from evaluation reports
+  profiler.py     Training and inference benchmarks
+  utils/          Device selection, AMP and CUDA graphs
+configs/          Per-category TOML configurations
+tests/            Unit, integration and accelerator regression tests
+relazione.md      Project report in Italian
+relazione_materiali/  Reports and charts cited in the project report
+```
+
+```bash
+uv run pytest tests/ -q
+uvx ruff check src tests
+uvx ty check src
+```
+
+Accelerator-specific tests skip when the required device is unavailable.
+Augmentation and synthetic data depend on seed, epoch and sample index so
+restarting workers preserves their reproducibility. Older checkpoints without
+MPS random-generator state cannot reproduce the original MPS stream exactly.
