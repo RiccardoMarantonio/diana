@@ -63,6 +63,123 @@ uv run python -m diana.sample --run 'runs/bottle-<timestamp>' --pixel
 computed. Evaluation uses `best.pt`, EMA weights, and the checkpoint's configured
 seed, `eval_t_start` and `sample_timesteps` unless explicitly overridden.
 
+## Demo: two defective and two healthy images
+
+For a complete demo with the existing checkpoints and dataset, run:
+
+```bash
+bash demo.sh
+```
+
+The script selects the most recently modified `best.pt` under `runs/bottle-*/`,
+selects the first two defective and first two healthy images in sorted path order,
+and calibrates on up to 10 other healthy images from `test/good`. All four inputs,
+including byte-identical copies, are excluded from calibration. Selection happens
+before inference and is independent of scores. These references are reserved for this demo's
+calibration; this workflow is **not an independent test-set evaluation**. The
+default is deliberately small for a quick demo, not a statistically reliable
+threshold estimate. It does not train a model or download data.
+
+Results are written to `demo/bottle/`: `threshold.json`, PNG and JSON files for
+`defective_1`, `defective_2`, `healthy_1` and `healthy_2`, plus `summary.png` (all
+four visualizations) and `summary.json`. The terminal compares expected and
+predicted labels, scores, and the number of correct predictions. Misclassifications
+are reported as such; the threshold is not adjusted to make these examples pass.
+All four predictions use the same threshold. Four examples are not an accuracy
+estimate for the dataset. The saved threshold is reused on subsequent runs. To choose
+a single image instead, another category, or recalibrate:
+
+```bash
+bash demo.sh --image data/mvtec/bottle/test/good/000.png --recalibrate
+bash demo.sh --category capsule
+bash demo.sh --recalibrate --device cpu
+```
+
+The prediction images (including byte-identical copies) are excluded when
+calibrating. If any target was already used by the saved calibration, the script
+automatically recalibrates excluding all current targets. After changing the
+model or device, use `--recalibrate`.
+For a specific model and a separate, known healthy reference set:
+
+```bash
+bash demo.sh --run 'runs/bottle-<timestamp>' \
+    --healthy-dir path/to/held_out_healthy_bottles \
+    --reference-limit 40 --image path/to/bottle.png
+```
+
+`--healthy-dir` and `--reference-limit` force recalibration. Other options include
+`--out-dir`, `--device` and `--help`. Relative paths are resolved from the project
+directory, even if the script is launched elsewhere. Missing data or checkpoints
+produce an error with instructions.
+
+All demo heatmaps use a **shared absolute color scale**, from zero to the maximum
+pixel error across the selected images, with the same numerical legend on each
+panel. The same color therefore represents the same squared error in all four
+images. This range is only for visualization; classification still compares the
+original mean error with the calibrated image threshold. Reports record the
+range under `heatmap_scale`. Each prediction also saves an `.npz` file containing
+the full-precision input crop, reconstruction and anomaly map, allowing the
+summary to be redrawn without rerunning inference.
+
+`diana.predict` accepts a single image of the checkpoint's category and prints
+**SANA / DIFETTOSA**, its anomaly score and the threshold used. It saves a labelled
+PNG with **input center crop → reconstruction → anomaly map**, plus a JSON report.
+No dataset or ground-truth mask is required for prediction.
+
+A binary decision requires a threshold. Calibrate it once on a directory of
+**known healthy images held out from training and final testing**, with matching
+category, framing and acquisition conditions:
+
+```bash
+uv run python -m diana.calibrate \
+    --run 'runs/bottle-<timestamp>' \
+    --images path/to/held_out_healthy_bottles \
+    --out demo/bottle-threshold.json
+```
+
+The directory is searched recursively for PNG/JPEG/BMP images. The default
+threshold is the empirical 95th percentile of healthy reconstruction scores
+(`--quantile 0.95`, with the higher observation used for interpolation).
+At least two distinct files are required; use a larger, representative reference
+set (preferably dozens of images). This percentile does **not** guarantee a 5%
+false-alarm rate on future images, and calibration on training images is biased.
+Optional `--limit N` caps the references and repeatable `--exclude-image FILE`
+options exclude prediction images and byte-identical copies before selecting that subset.
+
+Then classify a separate image:
+
+```bash
+uv run python -m diana.predict \
+    --run 'runs/bottle-<timestamp>' \
+    --image data/mvtec/bottle/test/broken_small/000.png \
+    --calibration demo/bottle-threshold.json \
+    --out demo/bottle-prediction.png \
+    --report demo/bottle-prediction.json
+```
+
+An image is classified as defective when `score > threshold`; equality is
+classified as healthy. The score is the same mean squared reconstruction error
+used by evaluation, **not a probability**. To supply an existing threshold
+manually, replace `--calibration ...` with `--threshold YOUR_NUMERIC_THRESHOLD`.
+One of these two options is required; the command never invents a cutoff from
+the image being classified or from AUROC.
+
+Both commands accept `--device auto|cpu|mps|cuda`, `--tag best|last`, `--seed`,
+`--t_start`, `--num_steps` and `--no_ema`. By default they use the checkpoint's
+seed, noise level, sampling grid and EMA weights, and select an available device
+on the current machine. Calibration records the checkpoint SHA-256 and scoring
+settings; prediction rejects incompatible settings and images whose file hash
+appears in the reference set. Use matching options in both commands, or
+recalibrate after changing the checkpoint, device or sampling settings. Each
+image uses batch size 1 and a fresh reset to the same seed, so its score does not
+depend on reference order. Device kernels can still introduce nondeterminism.
+
+The verdict concerns the **center crop actually seen by the model** (64 × 64
+with the supplied configurations); defects outside it cannot be detected.
+Standalone predictions show an absolute zero-to-maximum scale for that image;
+the demo redraws them with the range shared across its inputs. This is a thresholded model
+prediction and can produce both missed defects and false alarms.
+
 ## Complete workflow
 
 `t4.sh` downloads or verifies the data, profiles synthetic training, trains the
@@ -270,6 +387,10 @@ src/diana/
   models/         U-Net and EMA weights
   train.py        Training, checkpoint saving and recovery
   sample.py       Anomaly maps, image/pixel AUROC and image grids
+  prediction.py   Shared single-image scoring and labelled visualization
+  demo_summary.py Demo comparison with shared heatmap scale and numeric legends
+  calibrate.py    Healthy-reference threshold calibration
+  predict.py      Single-image healthy/defective demo
   plot_eval.py    CSV tables and SVG charts from evaluation reports
   profiler.py     Training and inference benchmarks
   utils/          Device selection, AMP and CUDA graphs
